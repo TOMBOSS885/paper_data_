@@ -1,0 +1,214 @@
+openapi: 3.1.0
+info:
+  title: Personal Paper Knowledge Base API
+  version: 0.1.0
+  description: See 02-api-spec.md for validation, rate limits, and security rules.
+servers:
+  - url: /api
+security:
+  - sessionCookie: []
+paths:
+  /setup/status:
+    get:
+      summary: Check whether the one-time setup is complete
+      security: []
+      responses:
+        '200':
+          description: Setup state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+  /auth/send-code:
+    post:
+      summary: Send an email verification code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendCodeRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/Accepted' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /setup/admin:
+    post:
+      summary: Create the only administrator during first deployment
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAdminRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/Created' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /auth/login:
+    post:
+      summary: Login with password and optional email verification code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '202': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '423': { $ref: '#/components/responses/Locked' }
+  /auth/logout:
+    post:
+      summary: Revoke current session
+      responses:
+        '204': { description: Session revoked }
+  /auth/me:
+    get:
+      summary: Return current administrator profile
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+  /papers:
+    get:
+      summary: Search and paginate papers
+      parameters:
+        - { $ref: '#/components/parameters/Q' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+    post:
+      summary: Upload papers for asynchronous parsing
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  maxItems: 50
+                  items: { type: string, format: binary }
+                importMode: { type: string, enum: [metadata_only, fulltext] }
+      responses:
+        '202': { $ref: '#/components/responses/Accepted' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+  /papers/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      summary: Get paper metadata and associations
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+    patch:
+      summary: Update paper metadata using optimistic locking
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/PatchPaperRequest' } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      summary: Soft-delete a paper and enqueue physical cleanup
+      responses:
+        '204': { description: Deleted }
+  /papers/{id}/preview:
+    get:
+      summary: Get a short-lived preview URL or stream
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+  /papers/{id}/download:
+    get:
+      summary: Download a paper after authorization and audit logging
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      responses:
+        '200': { description: Binary paper content }
+  /search/external:
+    get:
+      summary: Search OpenAlex, Crossref, or Semantic Scholar through the API proxy
+      parameters:
+        - { name: source, in: query, required: true, schema: { type: string, enum: [openalex, crossref, semanticscholar] } }
+        - { name: q, in: query, required: true, schema: { type: string, maxLength: 300 } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /health:
+    get:
+      summary: Public liveness probe
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: pkb_session
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    Q: { name: q, in: query, schema: { type: string, maxLength: 500 } }
+    PageSize: { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+    Cursor: { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+  schemas:
+    Envelope:
+      type: object
+      required: [data, requestId]
+      properties:
+        data: {}
+        requestId: { type: string }
+    SendCodeRequest:
+      type: object
+      required: [email, purpose]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        purpose: { type: string, enum: [setup, login, reset, change_email] }
+    CreateAdminRequest:
+      type: object
+      required: [email, displayName, password, code, setupNonce]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        displayName: { type: string, minLength: 1, maxLength: 80 }
+        password: { type: string, minLength: 12, maxLength: 256, writeOnly: true }
+        code: { type: string, pattern: '^[0-9]{6,8}$', writeOnly: true }
+        setupNonce: { type: string, minLength: 32, writeOnly: true }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, writeOnly: true }
+        code: { type: string, pattern: '^[0-9]{6,8}$', writeOnly: true }
+    PatchPaperRequest:
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer, minimum: 1 }
+        title: { type: string, maxLength: 1000 }
+        abstract: { type: string, maxLength: 100000 }
+        doi: { type: string, maxLength: 255 }
+        readingStatus: { type: string, enum: [unread, reading, read] }
+        isFavorite: { type: boolean }
+        tagIds: { type: array, maxItems: 100, items: { type: integer } }
+        categoryIds: { type: array, maxItems: 20, items: { type: integer } }
+  responses:
+    Ok:
+      description: Success
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/Envelope' } }
+    Created:
+      description: Created
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/Envelope' } }
+    Accepted:
+      description: Accepted for processing or verification
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/Envelope' } }
+    Conflict: { description: Conflict }
+    Unauthorized: { description: Authentication failed }
+    Locked: { description: Account temporarily locked }
+    RateLimited: { description: Rate limit exceeded, headers: { Retry-After: { schema: { type: integer } } } }
+    PayloadTooLarge: { description: Payload exceeds configured limit }

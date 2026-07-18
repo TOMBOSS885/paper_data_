@@ -1,0 +1,8 @@
+.env
+frontend/node_modules/
+frontend/dist/
+backend/uploads/
+.gocache/
+.gomodcache/
+frontend-dev*.log
+*.log
