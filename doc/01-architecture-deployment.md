@@ -95,7 +95,7 @@ API 镜像采用多阶段构建，最终镜像使用 distroless 或 Alpine、非
 
 1. 复制 `.env.example` 为 `.env`，生成随机 `JWT_SECRET`、数据库密码和 Redis 密码，填写 SMTP 授权码。
 2. 执行 `docker compose up -d mysql redis`，等待健康检查通过。
-3. 执行数据库版本迁移，生产环境 `AUTO_MIGRATE=false`，迁移通过版本化 SQL 完成。
+3. 保持 `AUTO_MIGRATE=true`，启动时执行版本化 SQL；已记录在 `schema_migrations` 的版本会自动跳过。本项目不使用 GORM 结构反射式 AutoMigrate。
 4. 启动 `api`、`worker` 和 `proxy`，访问 `/setup`。
 5. 页面调用 `GET /api/setup/status`；只有 `initialized=false` 才展示向导。
 6. 输入邮箱、密码、显示名，发送并提交邮箱验证码；服务端在事务中写入管理员和初始化标记。

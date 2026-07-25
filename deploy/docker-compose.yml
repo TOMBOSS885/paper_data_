@@ -12,7 +12,7 @@ services:
       MYSQL_HOST: mysql
       REDIS_ADDR: redis:6379
       UPLOAD_DIR: /app/uploads
-      AUTO_MIGRATE: "false"
+      AUTO_MIGRATE: "${AUTO_MIGRATE:-true}"
     depends_on:
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -30,7 +30,7 @@ services:
       context: ..
       dockerfile: frontend/Dockerfile
     depends_on: [api]
-    ports: ["80:8080"]
+    ports: ["${HTTP_PORT:-80}:8080"]
     networks: [internal]
     read_only: true
     tmpfs: [/var/cache/nginx, /var/run]

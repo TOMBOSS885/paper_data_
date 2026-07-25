@@ -22,14 +22,19 @@ React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范�
    $bytes = New-Object byte[] 48; [Security.Cryptography.RandomNumberGenerator]::Fill($bytes); [Convert]::ToBase64String($bytes)
    ```
 
-3. 在安装 Docker Engine/Compose 的机器执行：
+3. 在安装 Docker Engine/Compose 的机器一键部署：
 
-   ```powershell
-   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
-   docker compose --env-file .env -f deploy/docker-compose.yml logs -f api
+   ```bash
+   bash deploy.sh
    ```
 
-4. 打开 `http://localhost/setup`，输入 `.env` 中的 `SETUP_SECRET`、管理员邮箱、SMTP 验证码和强密码。初始化成功后 `/setup` 会自动关闭。
+   Windows Server/PowerShell：
+
+   ```powershell
+   .\deploy.ps1
+   ```
+
+4. 脚本会校验 `.env`、构建镜像、启动 MySQL/Redis/API/Web、执行版本化数据库迁移并等待健康检查。完成后打开 `/setup`，输入 `.env` 中的 `SETUP_SECRET`、管理员邮箱、SMTP 验证码和强密码。
 
 5. 生产环境必须使用 HTTPS 反向代理；当前 Compose Web 层提供安全响应头和 HTTP 入口，TLS 可由宿主机 Nginx/Caddy 或云负载均衡终止。
 

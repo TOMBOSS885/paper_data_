@@ -60,7 +60,12 @@ func Migrate(ctx context.Context, database *sql.DB) error {
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, string(body)); err == nil {
+		for _, statement := range splitSQLStatements(string(body)) {
+			if _, err = tx.ExecContext(ctx, statement); err != nil {
+				break
+			}
+		}
+		if err == nil {
 			_, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, UTC_TIMESTAMP(6))`, entry.Name())
 		}
 		if err != nil {
@@ -72,4 +77,47 @@ func Migrate(ctx context.Context, database *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func splitSQLStatements(sqlText string) []string {
+	var statements []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	for _, char := range sqlText {
+		if escaped {
+			current.WriteRune(char)
+			escaped = false
+			continue
+		}
+		if char == '\\' && quote != 0 {
+			current.WriteRune(char)
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			current.WriteRune(char)
+			if char == quote {
+				quote = 0
+			}
+			continue
+		}
+		if char == '\'' || char == '"' || char == '`' {
+			quote = char
+			current.WriteRune(char)
+			continue
+		}
+		if char == ';' {
+			if statement := strings.TrimSpace(current.String()); statement != "" {
+				statements = append(statements, statement)
+			}
+			current.Reset()
+			continue
+		}
+		current.WriteRune(char)
+	}
+	if statement := strings.TrimSpace(current.String()); statement != "" {
+		statements = append(statements, statement)
+	}
+	return statements
 }
