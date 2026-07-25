@@ -17,7 +17,7 @@ fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
   cp "$ROOT_DIR/.env.example" "$ENV_FILE"
-  echo "已创建 .env。请填写域名、MySQL/Redis 密码、JWT_SECRET、SETUP_SECRET 和 SMTP 后重新执行 ./deploy.sh。" >&2
+  echo "已创建 .env。请填写系统 MySQL、Redis、JWT_SECRET、SETUP_SECRET 和 SMTP 后重新执行 ./deploy.sh。" >&2
   exit 1
 fi
 
@@ -42,5 +42,5 @@ for _ in $(seq 1 30); do
 done
 
 echo "服务未在预期时间内就绪，显示最近日志：" >&2
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --tail=100 api web mysql redis >&2
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --tail=100 api web redis >&2
 exit 1

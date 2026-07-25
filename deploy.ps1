@@ -39,5 +39,5 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 3
 }
 
-docker compose --env-file $EnvFile -f $ComposeFile logs --tail=100 api web mysql redis
+docker compose --env-file $EnvFile -f $ComposeFile logs --tail=100 api web redis
 throw 'Services did not become ready. Inspect the logs above.'

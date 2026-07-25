@@ -6,7 +6,7 @@ React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范�
 
 - Go API：健康检查、一次性初始化、SMTP 验证码、Cookie 会话、CSRF、论文列表/全文查询、上传、详情、乐观锁更新、预览/下载、软删除、Dashboard。
 - React：`/setup`、登录二次验证、Dashboard、论文库、导入、分类标签基础工作区；使用 HttpOnly Cookie 和自动 CSRF 头。
-- Docker：`deploy/docker-compose.yml` 包含 API、Web、MySQL、Redis；数据库和 Redis 仅暴露在内部网络，Web 监听宿主机 80。
+- Docker：`deploy/docker-compose.yml` 包含 API、Web、Redis；API 通过 Docker host gateway 连接服务器系统 MySQL，Redis 仅在内部网络，Web 监听宿主机端口。
 
 ## 首次部署
 
@@ -16,7 +16,7 @@ React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范�
    Copy-Item .env.example .env
    ```
 
-2. 为 `MYSQL_PASSWORD`、`MYSQL_ROOT_PASSWORD`、`REDIS_PASSWORD`、`JWT_SECRET`、`SETUP_SECRET` 和 SMTP 配置填写真实值。可用 PowerShell 生成随机密钥：
+2. 为系统 MySQL 的 `MYSQL_PASSWORD`、`REDIS_PASSWORD`、`JWT_SECRET`、`SETUP_SECRET` 和 SMTP 配置填写真实值。可用 PowerShell 生成随机密钥：
 
    ```powershell
    $bytes = New-Object byte[] 48; [Security.Cryptography.RandomNumberGenerator]::Fill($bytes); [Convert]::ToBase64String($bytes)
@@ -34,7 +34,34 @@ React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范�
    .\deploy.ps1
    ```
 
-4. 脚本会校验 `.env`、构建镜像、启动 MySQL/Redis/API/Web、执行版本化数据库迁移并等待健康检查。完成后打开 `/setup`，输入 `.env` 中的 `SETUP_SECRET`、管理员邮箱、SMTP 验证码和强密码。
+4. 脚本会校验 `.env`、构建镜像、启动 Redis/API/Web、连接系统 MySQL、执行版本化数据库迁移并等待健康检查。完成后打开 `/setup`，输入 `.env` 中的 `SETUP_SECRET`、管理员邮箱、SMTP 验证码和强密码。
+
+## 准备系统 MySQL
+
+MySQL 必须监听 Docker 网桥可访问的地址。在宝塔或 `/etc/my.cnf` 中将 `bind-address` 设置为服务器内网地址或 `0.0.0.0`，重启 MySQL，然后创建仅允许项目 Docker 子网访问的数据库账号：
+
+```sql
+CREATE DATABASE IF NOT EXISTS paper_kb
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'paper_kb_app'@'172.30.0.%'
+  IDENTIFIED BY '与 .env 中 MYSQL_PASSWORD 相同的密码';
+GRANT ALL PRIVILEGES ON paper_kb.* TO 'paper_kb_app'@'172.30.0.%';
+FLUSH PRIVILEGES;
+```
+
+`.env` 对应配置：
+
+```env
+DOCKER_SUBNET=172.30.0.0/24
+MYSQL_HOST=host.docker.internal
+MYSQL_PORT=3306
+MYSQL_DATABASE=paper_kb
+MYSQL_USERNAME=paper_kb_app
+MYSQL_PASSWORD=上面设置的密码
+REDIS_DB=0
+```
+
+不要把 3306 开放到公网。防火墙只允许本机 Docker 子网 `172.30.0.0/24` 访问。若该网段与服务器现有网络冲突，同时修改 `DOCKER_SUBNET` 和 MySQL 用户的来源网段。
 
 5. 生产环境必须使用 HTTPS 反向代理；当前 Compose Web 层提供安全响应头和 HTTP 入口，TLS 可由宿主机 Nginx/Caddy 或云负载均衡终止。
 
@@ -46,7 +73,6 @@ React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范�
 GO_IMAGE=镜像加速域名/library/golang:1.22-alpine
 NODE_IMAGE=镜像加速域名/library/node:22-alpine
 NGINX_IMAGE=镜像加速域名/library/nginx:1.27-alpine
-MYSQL_IMAGE=镜像加速域名/library/mysql:8.4
 REDIS_IMAGE=镜像加速域名/library/redis:7.4-alpine
 ```
 

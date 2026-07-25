@@ -15,6 +15,10 @@ type Config struct {
 	Port              string
 	PublicBaseURL     string
 	MySQLDSN          string
+	RedisAddr         string
+	RedisPassword     string
+	RedisDB           int
+	RedisTLS          bool
 	JWTSecret         string
 	SetupSecret       string
 	CookieSecure      bool
@@ -44,6 +48,10 @@ func Load() (Config, error) {
 		Host:              getenv("SERVER_HOST", "0.0.0.0"),
 		Port:              getenv("SERVER_PORT", "8080"),
 		PublicBaseURL:     getenv("PUBLIC_BASE_URL", "http://localhost:8080"),
+		RedisAddr:         getenv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
+		RedisDB:           envInt("REDIS_DB", 0),
+		RedisTLS:          envBool("REDIS_TLS", false),
 		JWTSecret:         os.Getenv("JWT_SECRET"),
 		SetupSecret:       os.Getenv("SETUP_SECRET"),
 		CookieSecure:      envBool("COOKIE_SECURE", false),
@@ -99,6 +107,9 @@ func (c Config) validate() error {
 	}
 	if c.SearchMaxPageSize < 1 || c.SearchMaxPageSize > 100 {
 		return errors.New("SEARCH_MAX_PAGE_SIZE must be between 1 and 100")
+	}
+	if c.RedisDB < 0 || c.RedisDB > 15 {
+		return errors.New("REDIS_DB must be between 0 and 15")
 	}
 	if c.SMTPTLSMode != "starttls" && c.SMTPTLSMode != "tls" {
 		return errors.New("SMTP_TLS_MODE must be starttls or tls")

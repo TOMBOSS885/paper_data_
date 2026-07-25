@@ -26,22 +26,43 @@ import (
 	"paper-knowledge-base/backend/internal/config"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type Server struct {
 	cfg     config.Config
 	db      *sql.DB
+	redis   *redis.Client
 	limiter *limiter
 }
 
 type limiter struct {
 	mu       sync.Mutex
 	attempts map[string][]time.Time
+	redis    *redis.Client
 }
 
-func newLimiter() *limiter { return &limiter{attempts: make(map[string][]time.Time)} }
-func (l *limiter) allow(key string, max int, window time.Duration) bool {
+func newLimiter(redisClient *redis.Client) *limiter {
+	return &limiter{attempts: make(map[string][]time.Time), redis: redisClient}
+}
+
+var rateLimitScript = redis.NewScript(`
+local value = redis.call('INCR', KEYS[1])
+if value == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+if value <= tonumber(ARGV[2]) then return 1 else return 0 end
+`)
+
+func (l *limiter) allow(ctx context.Context, key string, max int, window time.Duration) bool {
+	if l.redis != nil {
+		allowed, err := rateLimitScript.Run(ctx, l.redis, []string{"paper-kb:limit:" + key}, window.Milliseconds(), max).Int()
+		if err == nil {
+			return allowed == 1
+		}
+		log.Printf("redis rate limiter fallback: %v", err)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
@@ -59,8 +80,8 @@ func (l *limiter) allow(key string, max int, window time.Duration) bool {
 	return true
 }
 
-func New(cfg config.Config, db *sql.DB) *Server {
-	return &Server{cfg: cfg, db: db, limiter: newLimiter()}
+func New(cfg config.Config, db *sql.DB, redisClient *redis.Client) *Server {
+	return &Server{cfg: cfg, db: db, redis: redisClient, limiter: newLimiter(redisClient)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -120,6 +141,12 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "service is not ready")
 		return
 	}
+	if s.redis != nil {
+		if err := s.redis.Ping(ctx).Err(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "service is not ready")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
 }
 
@@ -144,7 +171,7 @@ func (s *Server) sendCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := "code:" + strings.ToLower(strings.TrimSpace(req.Email)) + ":" + req.Purpose
-	if !s.limiter.allow(key, 6, time.Hour) || !s.limiter.allow("ip:"+clientIP(r), 30, time.Hour) {
+	if !s.limiter.allow(r.Context(), key, 6, time.Hour) || !s.limiter.allow(r.Context(), "ip:"+clientIP(r), 30, time.Hour) {
 		writeError(w, 429, "rate_limited", "please retry later")
 		return
 	}
@@ -244,7 +271,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "invalid_credentials", "invalid credentials")
 		return
 	}
-	if !s.limiter.allow("login-ip:"+clientIP(r), s.cfg.LoginMaxFails*3, s.cfg.LoginWindow) || !s.limiter.allow("login-email:"+strings.ToLower(strings.TrimSpace(req.Email)), s.cfg.LoginMaxFails*3, s.cfg.LoginWindow) {
+	if !s.limiter.allow(r.Context(), "login-ip:"+clientIP(r), s.cfg.LoginMaxFails*3, s.cfg.LoginWindow) || !s.limiter.allow(r.Context(), "login-email:"+strings.ToLower(strings.TrimSpace(req.Email)), s.cfg.LoginMaxFails*3, s.cfg.LoginWindow) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", "please retry later")
 		return
 	}

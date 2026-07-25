@@ -81,7 +81,7 @@ paper-knowledge-base/
 
 ## 5. Docker Compose 规范
 
-服务划分为 `proxy`、`api`、`worker`、`mysql`、`redis`。只有 `proxy` 映射宿主机 80/443；MySQL、Redis、API 使用内部网络，不映射公网端口。数据库数据、上传卷、备份卷分开管理。
+服务划分为 `proxy`、`api`、`worker`、`redis`。MySQL 使用服务器系统服务，API 通过 `host.docker.internal:host-gateway` 连接；3306 只允许项目 Docker 子网访问。只有 `proxy` 映射宿主机端口，Redis 和 API 不映射公网端口。
 
 API 镜像采用多阶段构建，最终镜像使用 distroless 或 Alpine、非 root UID、`read_only: true`、`cap_drop: [ALL]`、`security_opt: [no-new-privileges:true]`，仅 `/app/uploads` 和 `/tmp` 可写。固定基础镜像 digest，CI 使用 Trivy 扫描。
 
@@ -94,7 +94,7 @@ API 镜像采用多阶段构建，最终镜像使用 distroless 或 Alpine、非
 ## 6. 首次部署流程
 
 1. 复制 `.env.example` 为 `.env`，生成随机 `JWT_SECRET`、数据库密码和 Redis 密码，填写 SMTP 授权码。
-2. 执行 `docker compose up -d mysql redis`，等待健康检查通过。
+2. 在系统 MySQL 中创建目标库和仅允许项目 Docker 子网访问的应用账号，然后启动 Redis。
 3. 保持 `AUTO_MIGRATE=true`，启动时执行版本化 SQL；已记录在 `schema_migrations` 的版本会自动跳过。本项目不使用 GORM 结构反射式 AutoMigrate。
 4. 启动 `api`、`worker` 和 `proxy`，访问 `/setup`。
 5. 页面调用 `GET /api/setup/status`；只有 `initialized=false` 才展示向导。

@@ -11,13 +11,16 @@ services:
     environment:
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 8080
-      MYSQL_HOST: mysql
+      MYSQL_HOST: "${MYSQL_HOST:-host.docker.internal}"
+      MYSQL_PORT: "${MYSQL_PORT:-3306}"
       REDIS_ADDR: redis:6379
+      REDIS_DB: "${REDIS_DB:-0}"
       UPLOAD_DIR: /app/uploads
       AUTO_MIGRATE: "${AUTO_MIGRATE:-true}"
     depends_on:
-      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - paper_uploads:/app/uploads
     networks: [internal]
@@ -43,23 +46,6 @@ services:
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
-  mysql:
-    image: "${MYSQL_IMAGE:-mysql:8.4}"
-    environment:
-      MYSQL_DATABASE: ${MYSQL_DATABASE:?set MYSQL_DATABASE in .env}
-      MYSQL_USER: ${MYSQL_USERNAME:?set MYSQL_USERNAME in .env}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
-    volumes: [mysql_data:/var/lib/mysql]
-    networks: [internal]
-    expose: ["3306"]
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
   redis:
     image: "${REDIS_IMAGE:-redis:7.4-alpine}"
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
@@ -76,10 +62,12 @@ services:
     restart: unless-stopped
 
 volumes:
-  mysql_data:
   redis_data:
   paper_uploads:
 
 networks:
   internal:
     driver: bridge
+    ipam:
+      config:
+        - subnet: "${DOCKER_SUBNET:-172.30.0.0/24}"
