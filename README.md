@@ -38,6 +38,20 @@ React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范�
 
 5. 生产环境必须使用 HTTPS 反向代理；当前 Compose Web 层提供安全响应头和 HTTP 入口，TLS 可由宿主机 Nginx/Caddy 或云负载均衡终止。
 
+## Docker Hub 拉取超时
+
+项目的所有基础镜像都可以通过 `.env` 覆盖。服务器无法访问 Docker Hub 时，使用云厂商提供的可信镜像加速地址：
+
+```env
+GO_IMAGE=镜像加速域名/library/golang:1.22-alpine
+NODE_IMAGE=镜像加速域名/library/node:22-alpine
+NGINX_IMAGE=镜像加速域名/library/nginx:1.27-alpine
+MYSQL_IMAGE=镜像加速域名/library/mysql:8.4
+REDIS_IMAGE=镜像加速域名/library/redis:7.4-alpine
+```
+
+修改后重新运行 `bash deploy.sh`。生产环境应优先使用服务器云厂商提供的专属 Docker Hub 加速地址，并在部署后记录镜像 digest。
+
 ## 本地开发
 
 后端：

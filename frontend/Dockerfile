@@ -1,11 +1,13 @@
-FROM node:22-alpine AS build
+ARG NODE_IMAGE=node:22-alpine
+ARG NGINX_IMAGE=nginx:1.27-alpine
+FROM ${NODE_IMAGE} AS build
 WORKDIR /src
 COPY frontend/package*.json ./
 RUN npm ci --no-audit --no-fund
 COPY frontend .
 RUN npm run build
 
-FROM nginx:1.27-alpine
+FROM ${NGINX_IMAGE}
 RUN addgroup -S app && adduser -S -G app app
 COPY --from=build /src/dist /usr/share/nginx/html
 COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
