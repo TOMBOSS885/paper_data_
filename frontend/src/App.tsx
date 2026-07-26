@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookOpen, Download, Eye, LayoutDashboard, LogOut, Menu, Save, Search, Settings2, Star, Tags, Trash2, Upload, X } from 'lucide-react'
+import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Download, Eye, FolderPlus, LayoutDashboard, LogOut, Menu, Plus, Save, Search, Settings2, Star, Tag as TagIcon, Tags, Trash2, Upload, X } from 'lucide-react'
 import {
   ApiError,
   createAdmin,
   changePassword,
+  createCategory,
+  createTag,
   dashboard,
+  deleteCategory,
+  deleteTag,
   facets,
   fileUrl,
+  listCategories,
+  listTags,
   login,
   logout,
   me,
@@ -17,9 +23,23 @@ import {
   removePaper,
   setupStatus,
   updatePaper,
+  updatePaperCategories,
+  updatePaperTags,
   uploadPapers,
 } from './lib/api'
-import type { Facets, Paper, PaperDetail, UploadResult } from './lib/api'
+import type { Category, Facets, Paper, PaperDetail, Tag, UploadResult } from './lib/api'
+
+// 标签颜色映射：与 styles.css 中 .tag.<color> 的类名一致。
+const TAG_COLORS: { value: TagColor; label: string }[] = [
+  { value: 'teal', label: '青绿' },
+  { value: 'blue', label: '蓝' },
+  { value: 'amber', label: '琥珀' },
+  { value: 'rose', label: '玫瑰' },
+  { value: 'slate', label: '中性灰' },
+  { value: 'green', label: '草绿' },
+  { value: 'violet', label: '紫罗兰' },
+]
+type TagColor = Tag['color']
 
 const PAGE_SIZE = 20
 const ALLOWED_EXTENSIONS = ['.pdf', '.doc', '.docx', '.odt', '.tex', '.txt']
@@ -42,7 +62,7 @@ function Shell({ children }: { children: ReactNode }) {
     { to: '/app/dashboard', label: '概览', icon: LayoutDashboard },
     { to: '/app/papers', label: '论文库', icon: BookOpen },
     { to: '/app/import', label: '导入论文', icon: Upload },
-    { to: '/app/taxonomy', label: '分类浏览', icon: Tags },
+    { to: '/app/taxonomy', label: '分类与标签', icon: Tags },
     { to: '/app/settings/security', label: '安全设置', icon: Settings2 },
   ]
 
@@ -262,12 +282,20 @@ function Dashboard() {
 }
 
 function PaperRow({ paper }: { paper: Paper }) {
+  const tags = paper.tags ?? []
+  const cats = paper.categories ?? []
   return (
     <Link className="paper-row" to={`/app/papers/${paper.id}`}>
       <div className="paper-icon"><BookOpen size={18} /></div>
       <div className="paper-main">
         <strong>{paper.isFavorite ? '★ ' : ''}{paper.title}</strong>
         <span>{authorLine(paper)}{paper.journal ? ` · ${paper.journal}` : ''}</span>
+        {(tags.length > 0 || cats.length > 0) && (
+          <span className="row-taxonomy">
+            {cats.map((c) => <span className="taxonomy-chip cat" key={`c-${c.id}`}>{c.name}</span>)}
+            {tags.map((t) => <span className={`taxonomy-chip tag tag-${t.color}`} key={`t-${t.id}`}>#{t.name}</span>)}
+          </span>
+        )}
       </div>
       <span className="row-status">{statusLabel(paper.readingStatus)}</span>
     </Link>
@@ -293,6 +321,8 @@ function Papers() {
   const yearFrom = params.get('yearFrom') ?? ''
   const yearTo = params.get('yearTo') ?? ''
   const favorite = params.get('favorite') === 'true'
+  const tagFilter = params.get('tag') ?? ''
+  const categoryFilter = params.get('category') ?? ''
   const page = Math.max(1, Number(params.get('page') ?? '1') || 1)
 
   const [items, setItems] = useState<Paper[]>([])
@@ -300,6 +330,8 @@ function Papers() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [draft, setDraft] = useState(q)
+  const [allTags, setAllTags] = useState<Tag[]>([])
+  const [allCategories, setAllCategories] = useState<Category[]>([])
 
   const update = useCallback(
     (patch: Record<string, string | null>) => {
@@ -330,11 +362,22 @@ function Papers() {
     if (favorite) search.set('favorite', 'true')
     if (yearFrom) search.set('yearFrom', yearFrom)
     if (yearTo) search.set('yearTo', yearTo)
+    if (tagFilter) search.set('tag', tagFilter)
+    if (categoryFilter) search.set('category', categoryFilter)
     if (sort && sort !== 'newest') search.set('sort', sort)
     search.set('pageSize', String(PAGE_SIZE))
     if (page > 1) search.set('page', String(page))
     return `?${search.toString()}`
-  }, [q, status, favorite, yearFrom, yearTo, sort, page])
+  }, [q, status, favorite, yearFrom, yearTo, tagFilter, categoryFilter, sort, page])
+
+  // 加载一次标签与分类，供筛选器使用。
+  useEffect(() => {
+    Promise.all([listTags().then((r) => r.data.items).catch(() => [] as Tag[]), listCategories().then((r) => r.data.items).catch(() => [] as Category[])])
+      .then(([tags, cats]) => {
+        setAllTags(tags)
+        setAllCategories(cats)
+      })
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -359,7 +402,7 @@ function Papers() {
   }, [queryString])
 
   const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const filtered = Boolean(q || status || favorite || yearFrom || yearTo)
+  const filtered = Boolean(q || status || favorite || yearFrom || yearTo || tagFilter || categoryFilter)
 
   return (
     <Shell>
@@ -403,6 +446,23 @@ function Papers() {
             <input type="checkbox" checked={favorite} onChange={(e) => update({ favorite: e.target.checked ? 'true' : null })} />
             只看收藏
           </label>
+          <label className="field-tight">
+            按分类
+            <select value={categoryFilter} onChange={(e) => update({ category: e.target.value })}>
+              <option value="">全部分类</option>
+              {allCategories.flatMap((c) => [
+                <option key={`c-${c.id}`} value={String(c.id)}>{c.name} ({c.paperCount})</option>,
+                ...c.children.map((sc) => <option key={`sc-${sc.id}`} value={String(sc.id)}>{c.name} / {sc.name} ({sc.paperCount})</option>),
+              ])}
+            </select>
+          </label>
+          <label className="field-tight">
+            按标签
+            <select value={tagFilter} onChange={(e) => update({ tag: e.target.value })}>
+              <option value="">全部标签</option>
+              {allTags.map((t) => <option key={t.id} value={String(t.id)}>{t.name} ({t.usageCount ?? 0})</option>)}
+            </select>
+          </label>
           {filtered && (
             <button className="button secondary full" onClick={() => setParams(new URLSearchParams(), { replace: true })}>重置筛选</button>
           )}
@@ -445,23 +505,74 @@ function PaperDetailPage() {
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [allTags, setAllTags] = useState<Tag[]>([])
+  const [allCategories, setAllCategories] = useState<Category[]>([])
+  const [selectedTagIDs, setSelectedTagIDs] = useState<number[]>([])
+  const [selectedCategoryIDs, setSelectedCategoryIDs] = useState<number[]>([])
 
   const apply = (detail: PaperDetail) => {
     setData(detail)
     setForm({ title: detail.title ?? '', abstract: detail.abstract ?? '', doi: detail.doi ?? '', readingStatus: detail.readingStatus ?? 'unread' })
+    setSelectedTagIDs((detail.tags ?? []).map((t) => t.id))
+    setSelectedCategoryIDs((detail.categories ?? []).map((c) => c.id))
   }
 
   useEffect(() => {
     let alive = true
     setLoading(true)
-    fetchPaper(id)
-      .then((r) => alive && apply(r.data))
+    Promise.all([
+      fetchPaper(id),
+      listTags().then((r) => r.data.items).catch(() => [] as Tag[]),
+      listCategories().then((r) => r.data.items).catch(() => [] as Category[]),
+    ])
+      .then(([paper, tags, cats]) => {
+        if (!alive) return
+        apply(paper.data)
+        setAllTags(tags)
+        setAllCategories(cats)
+      })
       .catch((e) => alive && setError(errorMessage(e)))
       .finally(() => alive && setLoading(false))
     return () => {
       alive = false
     }
   }, [id])
+
+  const flatCategories = useMemo(() => {
+    const out: { id: number; name: string }[] = []
+    const walk = (list: Category[], prefix = '') => {
+      list.forEach((c) => {
+        out.push({ id: c.id, name: prefix ? `${prefix} / ${c.name}` : c.name })
+        walk(c.children, prefix ? `${prefix} / ${c.name}` : c.name)
+      })
+    }
+    walk(allCategories)
+    return out
+  }, [allCategories])
+
+  const toggleTag = (id: number) => {
+    setSelectedTagIDs((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
+  const toggleCategory = (id: number) => {
+    setSelectedCategoryIDs((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
+  const saveTaxonomy = async () => {
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      await updatePaperTags(id, selectedTagIDs)
+      await updatePaperCategories(id, selectedCategoryIDs)
+      // 重新拉详情，确保计数更新
+      const r = await fetchPaper(id)
+      apply(r.data)
+      setNotice('已更新标签和分类')
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const patch = async (payload: Record<string, unknown>, message: string) => {
     if (!data) return
@@ -538,6 +649,37 @@ function PaperDetailPage() {
               <Save size={16} />{busy ? '保存中…' : '保存修改'}
             </button>
             <button className="button secondary" disabled={busy} onClick={destroy}><Trash2 size={16} />删除论文</button>
+          </div>
+          <div className="taxonomy-editor">
+            <h3>分类</h3>
+            {flatCategories.length === 0 ? (
+              <p className="muted">还没有分类，可到「分类与标签」页面创建。</p>
+            ) : (
+              <div className="chip-grid">
+                {flatCategories.map((c) => (
+                  <label key={c.id} className={`chip-pick${selectedCategoryIDs.includes(c.id) ? ' on' : ''}`}>
+                    <input type="checkbox" checked={selectedCategoryIDs.includes(c.id)} onChange={() => toggleCategory(c.id)} />
+                    {c.name}
+                  </label>
+                ))}
+              </div>
+            )}
+            <h3>标签</h3>
+            {allTags.length === 0 ? (
+              <p className="muted">还没有标签，可到「分类与标签」页面创建。</p>
+            ) : (
+              <div className="chip-grid">
+                {allTags.map((t) => (
+                  <label key={t.id} className={`chip-pick chip-${t.color}${selectedTagIDs.includes(t.id) ? ' on' : ''}`}>
+                    <input type="checkbox" checked={selectedTagIDs.includes(t.id)} onChange={() => toggleTag(t.id)} />
+                    #{t.name}
+                  </label>
+                ))}
+              </div>
+            )}
+            <button className="button primary" disabled={busy} onClick={saveTaxonomy}>
+              <Save size={16} />{busy ? '保存中…' : '保存分类和标签'}
+            </button>
           </div>
         </div>
         <div className="panel">
@@ -653,61 +795,183 @@ function Import() {
 }
 
 function Taxonomy() {
-  const [data, setData] = useState<Facets | null>(null)
+  const [tab, setTab] = useState<'tags' | 'categories'>('categories')
+  const [tags, setTags] = useState<Tag[]>([])
+  const [categories, setCategories] = useState<Category[]>([])
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [newTag, setNewTag] = useState({ name: '', color: 'teal' })
+  const [newCat, setNewCat] = useState({ name: '', parentId: '' as string })
+  const [busy, setBusy] = useState(false)
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({})
 
-  useEffect(() => {
-    facets()
-      .then((r) => setData(r.data))
-      .catch((e) => setError(errorMessage(e)))
+  const reload = useCallback(async () => {
+    try {
+      const [t, c] = await Promise.all([listTags().then((r) => r.data.items), listCategories().then((r) => r.data.items)])
+      setTags(t)
+      setCategories(c)
+    } catch (e) {
+      setError(errorMessage(e))
+    }
   }, [])
 
-  const statuses = data?.statuses ?? {}
-  const empty = data && data.years.length === 0 && data.journals.length === 0 && !Object.values(statuses).some(Boolean)
+  useEffect(() => {
+    void reload()
+  }, [reload])
+
+  const submitTag = async () => {
+    if (!newTag.name.trim()) return setError('请输入标签名')
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      await createTag(newTag.name.trim(), newTag.color)
+      setNewTag({ name: '', color: 'teal' })
+      await reload()
+      setNotice(`已创建标签：${newTag.name.trim()}`)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const submitCategory = async () => {
+    if (!newCat.name.trim()) return setError('请输入分类名')
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      await createCategory({
+        name: newCat.name.trim(),
+        parentId: newCat.parentId ? Number(newCat.parentId) : null,
+        sortOrder: 0,
+      })
+      setNewCat({ name: '', parentId: '' })
+      await reload()
+      setNotice(`已创建分类：${newCat.name.trim()}`)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const renderCategoryNode = (c: Category, depth = 0): ReactNode => {
+    const isOpen = expanded[c.id] ?? true
+    const remove = async () => {
+      if (!window.confirm(`删除分类「${c.name}」？会同时移除其子分类与已关联论文的绑定。`)) return
+      try {
+        await deleteCategory(c.id)
+        await reload()
+        setNotice(`已删除分类：${c.name}`)
+      } catch (e) {
+        setError(errorMessage(e))
+      }
+    }
+    return (
+      <div key={c.id} className="cat-node" style={{ paddingLeft: depth * 14 }}>
+        <div className="cat-row">
+          <button className="icon-button" aria-label={isOpen ? '收起' : '展开'} onClick={() => setExpanded((m) => ({ ...m, [c.id]: !(m[c.id] ?? true) }))}>
+            {c.children.length > 0 ? (isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span style={{ width: 14 }} />}
+          </button>
+          <Link to={`/app/papers?category=${c.id}`}>{c.name}</Link>
+          <small>{c.paperCount} 篇</small>
+          <button className="icon-button danger" aria-label="删除分类" onClick={remove}><Trash2 size={14} /></button>
+        </div>
+        {isOpen && c.children.map((sc) => renderCategoryNode(sc, depth + 1))}
+      </div>
+    )
+  }
 
   return (
     <Shell>
       <div className="page-head">
         <div>
           <p className="eyebrow">知识组织</p>
-          <h1>分类浏览</h1>
-          <p className="muted">按发表年份、期刊和阅读状态查看知识库分布，点击任意条目进入筛选结果。</p>
+          <h1>分类与标签</h1>
+          <p className="muted">分类用于分层组织论文，标签用于横向标注主题。删除分类会同时移除其子分类与对应论文关联。</p>
         </div>
       </div>
       {error && <div className="alert error">{error}</div>}
-      {!data ? (
-        <div className="loading">正在统计…</div>
-      ) : empty ? (
-        <Empty title="还没有可统计的数据" description="导入论文后，这里会按年份和期刊自动归类。" action={<Link className="button secondary" to="/app/import"><Upload size={16} />导入论文</Link>} />
-      ) : (
-        <div className="taxonomy-grid">
+      {notice && <div className="alert ok">{notice}</div>}
+      <div className="tab-bar">
+        <button className={tab === 'categories' ? 'tab active' : 'tab'} onClick={() => setTab('categories')}>分类树</button>
+        <button className={tab === 'tags' ? 'tab active' : 'tab'} onClick={() => setTab('tags')}>标签</button>
+      </div>
+      {tab === 'categories' && (
+        <div className="taxonomy-grid single">
           <div className="panel">
-            <div className="panel-head"><h2>按年份</h2></div>
-            <div className="tree">
-              {data.years.length === 0 && <p className="muted">还没有带发表年份的论文。</p>}
-              {data.years.map((y) => (
-                <Link className="tree-item" key={y.year} to={`/app/papers?yearFrom=${y.year}&yearTo=${y.year}`}>{y.year} 年<small>{y.count} 篇</small></Link>
-              ))}
-              {data.missingYear > 0 && <div className="tree-item">年份未填写<small>{data.missingYear} 篇</small></div>}
+            <div className="panel-head">
+              <h2>分类</h2>
+              <small>共 {categories.reduce((sum, c) => sum + 1 + c.children.length, 0)} 项</small>
             </div>
+            {categories.length === 0 ? (
+              <p className="muted">还没有分类。下方创建第一个根分类。</p>
+            ) : (
+              <div className="cat-tree">{categories.map((c) => renderCategoryNode(c))}</div>
+            )}
           </div>
           <div className="panel">
-            <div className="panel-head"><h2>阅读进度</h2></div>
-            <div className="tree">
-              <Link className="tree-item root" to="/app/papers?status=unread">未读<small>{statuses.unread ?? 0} 篇</small></Link>
-              <Link className="tree-item root" to="/app/papers?status=reading">阅读中<small>{statuses.reading ?? 0} 篇</small></Link>
-              <Link className="tree-item root" to="/app/papers?status=read">已读<small>{statuses.read ?? 0} 篇</small></Link>
-              <Link className="tree-item root" to="/app/papers?favorite=true">收藏<small>{data.favorites} 篇</small></Link>
+            <div className="panel-head"><h2>新建分类</h2></div>
+            <label className="field">分类名<input value={newCat.name} onChange={(e) => setNewCat({ ...newCat, name: e.target.value })} placeholder="例如：机器学习" /></label>
+            <label className="field">
+              父分类
+              <select value={newCat.parentId} onChange={(e) => setNewCat({ ...newCat, parentId: e.target.value })}>
+                <option value="">无（顶级分类）</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={String(c.id)}>{c.name}</option>
+                ))}
+              </select>
+            </label>
+            <div className="import-actions">
+              <button className="button primary" onClick={submitCategory} disabled={busy}><FolderPlus size={16} />{busy ? '创建中…' : '创建分类'}</button>
             </div>
+            <div className="filter-note">同名分类在同一个父分类下会自动合并，已合并的分类下论文计数会汇总。</div>
+          </div>
+        </div>
+      )}
+      {tab === 'tags' && (
+        <div className="taxonomy-grid single">
+          <div className="panel">
+            <div className="panel-head"><h2>现有标签</h2><small>共 {tags.length} 个</small></div>
+            {tags.length === 0 ? (
+              <p className="muted">还没有标签。右侧创建一个吧。</p>
+            ) : (
+              <div className="tag-cloud">
+                {[...tags].sort((a, b) => (b.usageCount ?? 0) - (a.usageCount ?? 0) || a.name.localeCompare(b.name)).map((t) => (
+                  <span className={`tag tag-${t.color}`} key={t.id}>
+                    <Link to={`/app/papers?tag=${t.id}`}>#{t.name} <small>{t.usageCount ?? 0}</small></Link>
+                    <button
+                      className="tag-remove"
+                      aria-label="删除标签"
+                      onClick={async (e) => {
+                        e.preventDefault()
+                        if (!window.confirm(`删除标签「${t.name}」？所有论文的该标签关联都会被移除。`)) return
+                        try {
+                          await deleteTag(t.id)
+                          await reload()
+                          setNotice(`已删除标签：${t.name}`)
+                        } catch (err) {
+                          setError(errorMessage(err))
+                        }
+                      }}
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
           <div className="panel">
-            <div className="panel-head"><h2>按期刊 / 来源</h2></div>
-            <div className="tag-cloud">
-              {data.journals.length === 0 && <p className="muted">期刊字段为空，可在论文详情页补充。</p>}
-              {data.journals.map((j) => (
-                <Link className="tag teal" key={j.name} to={`/app/papers?q=${encodeURIComponent(j.name)}`}>{j.name} · {j.count}</Link>
-              ))}
+            <div className="panel-head"><h2>新建标签</h2></div>
+            <label className="field">标签名<input value={newTag.name} onChange={(e) => setNewTag({ ...newTag, name: e.target.value })} placeholder="例如：survey" maxLength={40} /></label>
+            <label className="field">颜色<div className="color-row">{TAG_COLORS.map((c) => <button key={c.value} className={`color-swatch tag-${c.value}${newTag.color === c.value ? ' on' : ''}`} type="button" aria-label={c.label} onClick={() => setNewTag({ ...newTag, color: c.value })} />)}</div></label>
+            <div className="import-actions">
+              <button className="button primary" onClick={submitTag} disabled={busy}><TagIcon size={16} />{busy ? '创建中…' : '创建标签'}</button>
             </div>
+            <div className="filter-note">同名标签会自动合并、保留最新颜色。可在论文详情里多选打标。</div>
           </div>
         </div>
       )}

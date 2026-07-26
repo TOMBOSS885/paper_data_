@@ -57,6 +57,15 @@ export async function api<T>(path: string, init: Options = {}): Promise<T> {
 }
 
 export type Author = { name: string }
+export type Tag = { id: number; name: string; color: string; usageCount?: number }
+export type Category = {
+  id: number
+  parentId: number | null
+  name: string
+  sortOrder: number
+  paperCount: number
+  children: Category[]
+}
 export type Paper = {
   id: string
   title: string
@@ -69,6 +78,8 @@ export type Paper = {
   parseStatus?: string
   addedAt?: string
   updatedAt?: string
+  tags?: Tag[]
+  categories?: { id: number; name: string }[]
 }
 export type PaperDetail = Paper & {
   abstract?: string
@@ -97,6 +108,8 @@ export const paper = (id: string) => api<{ data: PaperDetail }>(`/papers/${encod
 export const updatePaper = (id: string, payload: Record<string, unknown>) =>
   api<{ data: PaperDetail }>(`/papers/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) })
 export const removePaper = (id: string) => api(`/papers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+export const updatePaperTags = (id: string, ids: number[]) => api(`/papers/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: JSON.stringify({ ids }) })
+export const updatePaperCategories = (id: string, ids: number[]) => api(`/papers/${encodeURIComponent(id)}/categories`, { method: 'PUT', body: JSON.stringify({ ids }) })
 export const uploadPapers = (files: File[]) => {
   const form = new FormData()
   files.forEach((file) => form.append('files[]', file))
@@ -104,6 +117,28 @@ export const uploadPapers = (files: File[]) => {
 }
 export const fileUrl = (id: string, kind: 'preview' | 'download') => `${API_BASE}/papers/${encodeURIComponent(id)}/${kind}`
 
+export const listTags = () => api<{ data: { items: Tag[] } }>('/tags')
+export const createTag = (name: string, color: string) => api<Tag>('/tags', { method: 'POST', body: JSON.stringify({ name, color }) })
+export const deleteTag = async (id: number) => {
+  await api(`/tags/${id}`, { method: 'DELETE' })
+}
+export const listCategories = () => api<{ data: { items: Category[] } }>('/categories')
+export const createCategory = (payload: { name: string; parentId?: number | null; sortOrder?: number }) =>
+  api<Category>('/categories', { method: 'POST', body: JSON.stringify(payload) })
+export const deleteCategory = async (id: number) => {
+  await api(`/categories/${id}`, { method: 'DELETE' })
+}
+
 export const facets = () => api<{ data: Facets }>('/facets')
 export const dashboard = () =>
   api<{ data: { totalPapers?: number; importedLast30Days?: number; unread?: number; favorites?: number; storageBytes?: number; recent?: Paper[] } }>('/dashboard')
+
+export const TAG_COLORS: { value: string; label: string }[] = [
+  { value: 'teal', label: '青绿' },
+  { value: 'blue', label: '蓝' },
+  { value: 'amber', label: '琥珀' },
+  { value: 'rose', label: '玫瑰' },
+  { value: 'slate', label: '中性灰' },
+  { value: 'green', label: '草绿' },
+  { value: 'violet', label: '紫罗兰' },
+]

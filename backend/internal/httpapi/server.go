@@ -91,6 +91,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/password", s.changePassword)
 	mux.HandleFunc("/api/dashboard", s.dashboard)
 	mux.HandleFunc("/api/facets", s.facets)
+	mux.HandleFunc("/api/tags", s.tags)
+	mux.HandleFunc("/api/tags/", s.tagByID)
+	mux.HandleFunc("/api/categories", s.categories)
+	mux.HandleFunc("/api/categories/", s.categoryByID)
 	mux.HandleFunc("/api/papers", s.papers)
 	mux.HandleFunc("/api/papers/", s.paperByID)
 	return s.withMiddleware(mux)
@@ -295,6 +299,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	var last30 int
 	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND added_at >= UTC_TIMESTAMP(6) - INTERVAL 30 DAY`).Scan(&last30)
 	recent := make([]map[string]any, 0, 5)
+	recentIDs := make([]string, 0, 5)
 	if rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 5`); err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -307,6 +312,17 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			recent = append(recent, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
+			recentIDs = append(recentIDs, id)
+		}
+	}
+	if tags, cats, terr := s.loadTaxonomy(r.Context(), recentIDs); terr == nil {
+		for i, id := range recentIDs {
+			if ts, ok := tags[id]; ok {
+				recent[i]["tags"] = ts
+			}
+			if cs, ok := cats[id]; ok {
+				recent[i]["categories"] = cs
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -422,6 +438,465 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"passwordChanged": true, "sessionsRevoked": true})
 }
 
+// ===================== 标签 & 分类 =====================
+//
+// 设计：tags 与 categories 都是管理员全局资源，对所有论文可见；论文通过
+// paper_tags / paper_categories 两张中间表绑定。删除标签或分类时由数据库外键
+// ON DELETE CASCADE 自动清理中间表记录。统计字段 usage_count / paper_count 由
+// 触发器自动维护（见 002_taxonomy.sql 下方的增量计数逻辑）以避免列表页每次
+// 都做全表扫描。
+
+// tagColor 限制前端可选的颜色取值，避免任意 CSS 类被前端写入。
+var tagColorAllowed = map[string]bool{"teal": true, "blue": true, "amber": true, "rose": true, "slate": true, "green": true, "violet": true}
+
+// normalizeName 把名称折叠成可比较的形式：去除首尾空白、转小写、全角空格归一。
+// 用户名重复创建时按这个字符串去重。
+func normalizeName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "　", " ")
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return strings.ToLower(s)
+}
+
+func validColor(c string) bool { return tagColorAllowed[c] }
+
+func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.listTags(w, r)
+	case http.MethodPost:
+		s.createTag(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) listTags(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id, name, color, usage_count FROM tags ORDER BY usage_count DESC, name ASC LIMIT 500`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to list tags")
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0, 64)
+	for rows.Next() {
+		var id uint64
+		var name, color string
+		var usage int
+		if err := rows.Scan(&id, &name, &color, &usage); err != nil {
+			continue
+		}
+		items = append(items, map[string]any{"id": id, "name": name, "color": color, "usageCount": usage})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) createTag(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.allow("tag-create:"+clientIP(r), 60, time.Minute) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many tag creations")
+		return
+	}
+	var req struct {
+		Name  string `json:"name"`
+		Color string `json:"color"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if len(name) < 1 || len(name) > 40 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "tag name must be 1-40 characters")
+		return
+	}
+	if strings.ContainsAny(name, "\r\n\t") {
+		writeError(w, http.StatusBadRequest, "invalid_request", "tag name contains invalid characters")
+		return
+	}
+	color := req.Color
+	if color == "" {
+		color = "teal"
+	}
+	if !validColor(color) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "color is not allowed")
+		return
+	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(r.Context(), `INSERT INTO tags(name, normalized_name, color, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE color=VALUES(color), updated_at=VALUES(updated_at)`, name, normalizeName(name), color, now, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to create tag")
+		return
+	}
+	id, _ := res.LastInsertId()
+	// ON DUPLICATE 时 LastInsertId 不可靠，重新按归一化名查一次。
+	if id == 0 {
+		_ = s.db.QueryRowContext(r.Context(), `SELECT id FROM tags WHERE normalized_name=?`, normalizeName(name)).Scan(&id)
+	}
+	var usage int
+	_ = s.db.QueryRowContext(r.Context(), `SELECT usage_count FROM tags WHERE id=?`, id).Scan(&usage)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "name": name, "color": color, "usageCount": usage})
+}
+
+func (s *Server) categories(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.listCategories(w, r)
+	case http.MethodPost:
+		s.createCategory(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id, parent_id, name, sort_order, paper_count FROM categories ORDER BY parent_id ASC, sort_order ASC, name ASC`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to list categories")
+		return
+	}
+	defer rows.Close()
+	type node struct {
+		ID         uint64  `json:"id"`
+		ParentID   *uint64 `json:"parentId"`
+		Name       string  `json:"name"`
+		SortOrder  int     `json:"sortOrder"`
+		PaperCount int     `json:"paperCount"`
+		Children   []*node `json:"children"`
+	}
+	byParent := map[uint64][]*node{}
+	byID := map[uint64]*node{}
+	for rows.Next() {
+		var id, sort, count int
+		var parent sql.NullInt64
+		var name string
+		if err := rows.Scan(&id, &parent, &name, &sort, &count); err != nil {
+			continue
+		}
+		var parentPtr *uint64
+		if parent.Valid {
+			p := uint64(parent.Int64)
+			parentPtr = &p
+		}
+		n := &node{ID: uint64(id), ParentID: parentPtr, Name: name, SortOrder: sort, PaperCount: count, Children: []*node{}}
+		byID[uint64(id)] = n
+		if parent.Valid {
+			byParent[uint64(parent.Int64)] = append(byParent[uint64(parent.Int64)], n)
+		} else {
+			byParent[0] = append(byParent[0], n)
+		}
+	}
+	// 第二遍把子节点挂上去，限制递归深度防止恶意循环（虽然外键不允许，但 SQL 修复后可能历史数据残留）。
+	var attach func(parent uint64, list []*node, depth int)
+	attach = func(parent uint64, list []*node, depth int) {
+		if depth > 8 {
+			return
+		}
+		for _, n := range list {
+			children := byParent[n.ID]
+			n.Children = children
+			attach(n.ID, children, depth+1)
+		}
+	}
+	roots := byParent[0]
+	attach(0, roots, 1)
+	items := make([]map[string]any, 0, len(roots))
+	for _, n := range roots {
+		items = append(items, map[string]any{"id": n.ID, "parentId": n.ParentID, "name": n.Name, "sortOrder": n.SortOrder, "paperCount": n.PaperCount, "children": n.Children})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) createCategory(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.allow("category-create:"+clientIP(r), 60, time.Minute) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many category creations")
+		return
+	}
+	var req struct {
+		Name      string  `json:"name"`
+		ParentID  *uint64 `json:"parentId"`
+		SortOrder int     `json:"sortOrder"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if len(name) < 1 || len(name) > 60 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "category name must be 1-60 characters")
+		return
+	}
+	if strings.ContainsAny(name, "\r\n\t") {
+		writeError(w, http.StatusBadRequest, "invalid_request", "category name contains invalid characters")
+		return
+	}
+	if req.SortOrder < -10000 || req.SortOrder > 10000 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "sortOrder out of range")
+		return
+	}
+	now := time.Now().UTC()
+	var res sql.Result
+	var err error
+	if req.ParentID != nil {
+		// 显式确认父分类存在，避免传一个不存在的 id 触发外键错误后还要回卷事务。
+		var exists int
+		if err := s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM categories WHERE id=?`, *req.ParentID).Scan(&exists); err != nil || exists == 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "parent category does not exist")
+			return
+		}
+		res, err = s.db.ExecContext(r.Context(), `INSERT INTO categories(parent_id, name, normalized_name, sort_order, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE sort_order=VALUES(sort_order), updated_at=VALUES(updated_at)`, *req.ParentID, name, normalizeName(name), req.SortOrder, now, now)
+	} else {
+		res, err = s.db.ExecContext(r.Context(), `INSERT INTO categories(parent_id, name, normalized_name, sort_order, created_at, updated_at) VALUES(NULL, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE sort_order=VALUES(sort_order), updated_at=VALUES(updated_at)`, name, normalizeName(name), req.SortOrder, now, now)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to create category")
+		return
+	}
+	id, _ := res.LastInsertId()
+	if id == 0 {
+		q := `SELECT id FROM categories WHERE normalized_name=?`
+		args := []any{normalizeName(name)}
+		if req.ParentID != nil {
+			q += ` AND parent_id=?`
+			args = append(args, *req.ParentID)
+		} else {
+			q += ` AND parent_id IS NULL`
+		}
+		_ = s.db.QueryRowContext(r.Context(), q, args...).Scan(&id)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "name": name, "parentId": req.ParentID, "sortOrder": req.SortOrder, "paperCount": 0})
+}
+
+// tagByID 与 categoryByID 目前只支持 DELETE，依靠数据库外键级联清理中间表。
+func (s *Server) tagByID(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	if r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseUint(strings.TrimPrefix(r.URL.Path, "/api/tags/"), 10, 64)
+	if err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid tag id")
+		return
+	}
+	res, err := s.db.ExecContext(r.Context(), `DELETE FROM tags WHERE id=?`, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to delete tag")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "tag not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) categoryByID(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	if r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseUint(strings.TrimPrefix(r.URL.Path, "/api/categories/"), 10, 64)
+	if err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid category id")
+		return
+	}
+	res, err := s.db.ExecContext(r.Context(), `DELETE FROM categories WHERE id=?`, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to delete category")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "category not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// updatePaperTaxonomy 处理 /api/papers/{id}/tags 和 /api/papers/{id}/categories 的 PUT。
+// 用单次事务替换绑定 + 维护 usage_count，避免应用层与数据库计数漂移。
+func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, paperID, kind string) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	var req struct {
+		IDs []uint64 `json:"ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// 限制数量防止误用与拒绝服务。
+	if len(req.IDs) > 200 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "too many associations")
+		return
+	}
+	seen := make(map[uint64]struct{}, len(req.IDs))
+	for _, id := range req.IDs {
+		if id == 0 {
+			continue
+		}
+		seen[id] = struct{}{}
+	}
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update taxonomy")
+		return
+	}
+	defer tx.Rollback()
+
+	// 确认论文存在，避免对已删除论文留下孤儿。
+	var paperExists int
+	if err := tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE id=? AND deleted_at IS NULL`, paperID).Scan(&paperExists); err != nil || paperExists == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "paper not found")
+		return
+	}
+
+	// 记录旧绑定，便于在删除后扣减 usage_count / paper_count。
+	oldIDs := []uint64{}
+	var oldQuery, joinTable, joinPK, countColumn, countJoin string
+	switch kind {
+	case "tags":
+		joinTable = "paper_tags"
+		joinPK = "tag_id"
+		countColumn = "usage_count"
+		countJoin = "tags"
+		oldQuery = `SELECT tag_id FROM paper_tags WHERE paper_id=?`
+	case "categories":
+		joinTable = "paper_categories"
+		joinPK = "category_id"
+		countColumn = "paper_count"
+		countJoin = "categories"
+		oldQuery = `SELECT category_id FROM paper_categories WHERE paper_id=?`
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error", "unknown taxonomy kind")
+		return
+	}
+	oldRows, err := tx.QueryContext(r.Context(), oldQuery, paperID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to read taxonomy")
+		return
+	}
+	for oldRows.Next() {
+		var id uint64
+		if err := oldRows.Scan(&id); err == nil {
+			oldIDs = append(oldIDs, id)
+		}
+	}
+	oldRows.Close()
+
+	// 校验新 ID 全部存在，避免写入悬挂引用（FK 已经防住，但提前校验能给出更友好提示）。
+	if len(seen) > 0 {
+		newList := make([]any, 0, len(seen))
+		for id := range seen {
+			newList = append(newList, id)
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(newList)), ",")
+		checkSQL := `SELECT id FROM ` + countJoin + ` WHERE id IN (` + placeholders + `)`
+		checkRows, err := tx.QueryContext(r.Context(), checkSQL, newList...)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+			return
+		}
+		found := make(map[uint64]struct{}, len(seen))
+		for checkRows.Next() {
+			var id uint64
+			if err := checkRows.Scan(&id); err == nil {
+				found[id] = struct{}{}
+			}
+		}
+		checkRows.Close()
+		if len(found) != len(seen) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "one or more ids do not exist")
+			return
+		}
+	}
+
+	// 清空旧绑定。
+	if _, err := tx.ExecContext(r.Context(), `DELETE FROM `+joinTable+` WHERE paper_id=?`, paperID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to clear taxonomy")
+		return
+	}
+
+	// 写入新绑定 + 计数维护。
+	if len(seen) > 0 {
+		var b strings.Builder
+		b.WriteString(`INSERT INTO `)
+		b.WriteString(joinTable)
+		b.WriteString(`(paper_id, `)
+		b.WriteString(joinPK)
+		b.WriteString(`, created_at) VALUES `)
+		args := make([]any, 0, len(seen)*3)
+		i := 0
+		now := time.Now().UTC()
+		for id := range seen {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?, ?, ?)")
+			args = append(args, paperID, id, now)
+			i++
+		}
+		if _, err := tx.ExecContext(r.Context(), b.String(), args...); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to apply taxonomy")
+			return
+		}
+	}
+
+	// 计算差量并更新计数（增量而非全表扫描）。
+	oldSet := make(map[uint64]struct{}, len(oldIDs))
+	for _, id := range oldIDs {
+		oldSet[id] = struct{}{}
+	}
+	add := []uint64{}
+	remove := []uint64{}
+	for id := range seen {
+		if _, ok := oldSet[id]; !ok {
+			add = append(add, id)
+		}
+	}
+	for id := range oldSet {
+		if _, ok := seen[id]; !ok {
+			remove = append(remove, id)
+		}
+	}
+	adjustCount := func(ids []uint64, delta int) {
+		if len(ids) == 0 {
+			return
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, delta)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		_, _ = tx.ExecContext(r.Context(), `UPDATE `+countJoin+` SET `+countColumn+`=GREATEST(0, `+countColumn+`+?) WHERE id IN (`+placeholders+`)`, args...)
+	}
+	adjustCount(add, +1)
+	adjustCount(remove, -1)
+
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to commit taxonomy")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"paperId": paperID, "kind": kind, "ids": req.IDs})
+}
+
 func (s *Server) papers(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		s.listPapers(w, r)
@@ -476,6 +951,24 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 		where = append(where, "published_at <= ?")
 		args = append(args, fmt.Sprintf("%04d-12-31", y))
 	}
+	// 标签 / 分类过滤：参数是逗号分隔的 ID 列表，验证后用 EXISTS 子查询避免结果集膨胀。
+	tagIDs, categoryIDs := parseIDs(query.Get("tag")), parseIDs(query.Get("category"))
+	if len(tagIDs) > 0 || len(categoryIDs) > 0 {
+		var sub []string
+		if len(tagIDs) > 0 {
+			sub = append(sub, "EXISTS (SELECT 1 FROM paper_tags pt WHERE pt.paper_id=papers.id AND pt.tag_id IN ("+placeholders(len(tagIDs))+"))")
+			for _, id := range tagIDs {
+				args = append(args, id)
+			}
+		}
+		if len(categoryIDs) > 0 {
+			sub = append(sub, "EXISTS (SELECT 1 FROM paper_categories pc WHERE pc.paper_id=papers.id AND pc.category_id IN ("+placeholders(len(categoryIDs))+"))")
+			for _, id := range categoryIDs {
+				args = append(args, id)
+			}
+		}
+		where = append(where, "("+strings.Join(sub, " AND ")+")")
+	}
 	order := "added_at DESC"
 	switch query.Get("sort") {
 	case "oldest":
@@ -501,6 +994,7 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	items := make([]map[string]any, 0, pageSize)
+	ids := make([]string, 0, pageSize)
 	for rows.Next() {
 		var id, title, authors, status, parse string
 		var doi, journal sql.NullString
@@ -511,10 +1005,29 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		items = append(items, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
+		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
 		writeError(w, 500, "internal_error", "unable to query papers")
 		return
+	}
+	// 一次性加载当前页的标签/分类，避免 N+1。
+	tags, cats, terr := s.loadTaxonomy(r.Context(), ids)
+	if terr != nil {
+		writeError(w, 500, "internal_error", "unable to load taxonomy")
+		return
+	}
+	for i, id := range ids {
+		if ts, ok := tags[id]; ok {
+			items[i]["tags"] = ts
+		} else {
+			items[i]["tags"] = []any{}
+		}
+		if cs, ok := cats[id]; ok {
+			items[i]["categories"] = cs
+		} else {
+			items[i]["categories"] = []any{}
+		}
 	}
 	writeJSON(w, 200, map[string]any{"items": items, "page": page, "pageSize": pageSize, "total": total})
 }
@@ -532,7 +1045,7 @@ func paperSummary(id, title, authors string, doi, journal sql.NullString, publis
 	return map[string]any{
 		"id": id, "title": title, "authors": authorList, "doi": doi.String, "journal": journal.String,
 		"year": year, "readingStatus": status, "isFavorite": fav, "parseStatus": parse,
-		"addedAt": added, "updatedAt": updated,
+		"addedAt": added, "updatedAt": updated, "tags": []any{}, "categories": []any{},
 	}
 }
 
@@ -541,6 +1054,83 @@ func escapeLike(v string) string {
 	v = strings.ReplaceAll(v, "\\", "\\\\")
 	v = strings.ReplaceAll(v, "%", "\\%")
 	return strings.ReplaceAll(v, "_", "\\_")
+}
+
+// parseIDs 把逗号分隔的数字串解析成 uint64 列表，自动去重并丢弃非法值。
+func parseIDs(raw string) []uint64 {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	seen := make(map[uint64]struct{}, len(parts))
+	out := make([]uint64, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.ParseUint(p, 10, 64)
+		if err != nil || n == 0 {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", n), ",")
+}
+
+// loadTaxonomy 一次性把当前页论文的标签和分类全部加载好，避免 N+1 查询。
+func (s *Server) loadTaxonomy(ctx context.Context, paperIDs []string) (map[string][]map[string]any, map[string][]map[string]any, error) {
+	tags := map[string][]map[string]any{}
+	cats := map[string][]map[string]any{}
+	if len(paperIDs) == 0 {
+		return tags, cats, nil
+	}
+	args := make([]any, len(paperIDs))
+	for i, id := range paperIDs {
+		args[i] = id
+	}
+	q := `SELECT pt.paper_id, t.id, t.name, t.color FROM paper_tags pt JOIN tags t ON t.id=pt.tag_id WHERE pt.paper_id IN (` + placeholders(len(paperIDs)) + `) ORDER BY t.usage_count DESC, t.name ASC`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var pid string
+		var id uint64
+		var name, color string
+		if err := rows.Scan(&pid, &id, &name, &color); err != nil {
+			continue
+		}
+		tags[pid] = append(tags[pid], map[string]any{"id": id, "name": name, "color": color})
+	}
+	rows.Close()
+	q = `SELECT pc.paper_id, c.id, c.name FROM paper_categories pc JOIN categories c ON c.id=pc.category_id WHERE pc.paper_id IN (` + placeholders(len(paperIDs)) + `) ORDER BY c.sort_order ASC, c.name ASC`
+	rows, err = s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var pid string
+		var id uint64
+		var name string
+		if err := rows.Scan(&pid, &id, &name); err != nil {
+			continue
+		}
+		cats[pid] = append(cats[pid], map[string]any{"id": id, "name": name})
+	}
+	rows.Close()
+	return tags, cats, nil
 }
 
 func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
@@ -654,6 +1244,14 @@ func (s *Server) paperByID(w http.ResponseWriter, r *http.Request) {
 			s.fileResponse(w, r, parts[0])
 			return
 		}
+		if parts[1] == "tags" || parts[1] == "categories" {
+			if r.Method != http.MethodPut {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			s.updatePaperTaxonomy(w, r, parts[0], parts[1])
+			return
+		}
 		writeError(w, 404, "not_found", "paper not found")
 		return
 	}
@@ -690,6 +1288,15 @@ func (s *Server) getPaper(w http.ResponseWriter, r *http.Request, id string) {
 	item := paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated)
 	item["abstract"] = abstract
 	item["version"] = version
+	tags, cats, terr := s.loadTaxonomy(r.Context(), []string{id})
+	if terr == nil {
+		if ts, ok := tags[id]; ok {
+			item["tags"] = ts
+		}
+		if cs, ok := cats[id]; ok {
+			item["categories"] = cs
+		}
+	}
 	var fileName, mediaType, objectKey string
 	var fileSize int64
 	if err := s.db.QueryRowContext(r.Context(), `SELECT original_name,media_type,object_key,size_bytes FROM paper_files WHERE paper_id=? ORDER BY created_at DESC LIMIT 1`, id).Scan(&fileName, &mediaType, &objectKey, &fileSize); err == nil {
