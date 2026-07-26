@@ -1,4 +1,4 @@
-import { Component } from 'react'
+import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
@@ -318,17 +318,19 @@ function Dashboard() {
   )
 }
 
-function PaperRow({ paper, selectable, selected, onToggle }: { paper: Paper; selectable?: boolean; selected?: boolean; onToggle?: (id: string) => void }) {
-  const tags = paper.tags ?? []
-  const cats = paper.categories ?? []
+// memo 化后，列表项只在 paper 引用或 selected 变化时 re-render。
+// 父层 `Papers` 把 onToggle 用 useCallback 包好，memo 浅比较才有效。
+const PaperRow = memo(function PaperRow({ paper, selectable, selected, onToggle }: { paper: Paper; selectable?: boolean; selected?: boolean; onToggle?: (id: string) => void }) {
+  const tags = useMemo(() => paper.tags ?? [], [paper.tags])
+  const cats = useMemo(() => paper.categories ?? [], [paper.categories])
   const nav = useNavigate()
-  const goDetail = () => nav(`/app/papers/${paper.id}`)
-  const onKey = (e: React.KeyboardEvent) => {
+  const goDetail = useCallback(() => nav(`/app/papers/${paper.id}`), [nav, paper.id])
+  const onKey = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()
       goDetail()
     }
-  }
+  }, [goDetail])
   const stop = (e: React.MouseEvent | React.ChangeEvent) => e.stopPropagation()
   return (
     <div className={`paper-row${selectable ? ' selectable' : ''}${selected ? ' selected' : ''}`} role="link" tabIndex={0} onClick={goDetail} onKeyDown={onKey}>
@@ -360,7 +362,7 @@ function PaperRow({ paper, selectable, selected, onToggle }: { paper: Paper; sel
       <span className="row-status">{statusLabel(paper.readingStatus)}</span>
     </div>
   )
-}
+})
 
 function Empty({ title, description, action }: { title: string; description: string; action?: ReactNode }) {
   return (
@@ -526,7 +528,7 @@ function Papers() {
     setSelectedIds(new Set())
   }, [page, q, status, sort, yearFrom, yearTo, favorite ? '1' : '0', tagFilter, categoryFilter])
 
-  const toggleOne = (id: string) => {
+  const toggleOne = useCallback((id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
@@ -539,8 +541,8 @@ function Papers() {
       }
       return next
     })
-  }
-  const selectAllOnPage = () => {
+  }, [])
+  const selectAllOnPage = useCallback(() => {
     setSelectedIds((prev) => {
       const next = new Set(prev)
       for (const it of items) {
@@ -550,8 +552,8 @@ function Papers() {
       if (items.length > 100 && prev.size === 0) setBatchError(`一次最多选 100 篇；本页 ${items.length} 篇仅勾选了前 100。`)
       return next
     })
-  }
-  const clearSelection = () => setSelectedIds(new Set())
+  }, [items])
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), [])
   const selectedCount = selectedIds.size
   const allOnPageSelected = items.length > 0 && items.every((it) => selectedIds.has(it.id))
 
@@ -570,12 +572,15 @@ function Papers() {
 
   useEffect(() => setDraft(q), [q])
 
-  // 输入停止 300ms 后再写入 URL，避免每敲一个字就请求一次。
+  // useDeferredValue 让 React 19 把这个值标为低优先级，让出主线程给输入；
+  // 配合 300ms debounce 既保证 UI 不卡、又保证请求不爆。
+  const deferredDraft = useDeferredValue(draft)
   useEffect(() => {
-    if (draft.trim() === q) return
-    const timer = setTimeout(() => update({ q: draft.trim() }), 300)
+    const value = deferredDraft.trim()
+    if (value === q) return
+    const timer = setTimeout(() => update({ q: value }), 300)
     return () => clearTimeout(timer)
-  }, [draft, q, update])
+  }, [deferredDraft, q, update])
 
   const queryString = useMemo(() => {
     const search = new URLSearchParams()

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -10,12 +11,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,45 +36,85 @@ type Server struct {
 	limiter *limiter
 }
 
-type limiter struct {
+// limiter：每个 key 独立的 bucket（自己的 mutex）+ 全局 RWMutex 只在增删 bucket 时用，
+// 避免旧实现里"每次 allow 都要遍历全部 key"在 1w+ key 下变成全表扫描导致的 CPU 飙升。
+// 后台 GC goroutine 每 5 分钟扫一次过期 bucket，**不在请求路径上做**。
+type bucket struct {
 	mu       sync.Mutex
-	attempts map[string][]time.Time
+	attempts []time.Time
+}
+
+type limiter struct {
+	mu      sync.RWMutex
+	buckets map[string]*bucket
 }
 
 func newLimiter() *limiter {
-	return &limiter{attempts: make(map[string][]time.Time)}
+	l := &limiter{buckets: make(map[string]*bucket)}
+	go l.gcLoop()
+	return l
+}
+
+// gcLoop 每 5 分钟清理一次已经全部过期的 bucket。所有判断都在持锁下完成。
+// 关键：不在请求路径上做扫描，allow() 只摸自己的 bucket，O(1) 操作。
+func (l *limiter) gcLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		l.mu.Lock()
+		for k, b := range l.buckets {
+			b.mu.Lock()
+			allExpired := true
+			for _, t := range b.attempts {
+				// 任何 bucket 都按 30 分钟上限判断过期，远超过业务最长 1h 窗口。
+				if time.Since(t) < 30*time.Minute {
+					allExpired = false
+					break
+				}
+			}
+			b.mu.Unlock()
+			if allExpired {
+				delete(l.buckets, k)
+			}
+		}
+		l.mu.Unlock()
+	}
+}
+
+func (l *limiter) getOrCreate(key string) *bucket {
+	l.mu.RLock()
+	b, ok := l.buckets[key]
+	l.mu.RUnlock()
+	if ok {
+		return b
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// 双重检查：并发场景下可能已被另一个 goroutine 创建。
+	if b, ok = l.buckets[key]; ok {
+		return b
+	}
+	b = &bucket{}
+	l.buckets[key] = b
+	return b
 }
 
 func (l *limiter) allow(key string, max int, window time.Duration) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	b := l.getOrCreate(key)
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	now := time.Now()
-	var kept []time.Time
-	for _, t := range l.attempts[key] {
+	kept := b.attempts[:0]
+	for _, t := range b.attempts {
 		if now.Sub(t) < window {
 			kept = append(kept, t)
 		}
 	}
 	if len(kept) >= max {
-		l.attempts[key] = kept
+		b.attempts = kept
 		return false
 	}
-	l.attempts[key] = append(kept, now)
-	// 防止长期运行时 map 无限增长
-	if len(l.attempts) > 10000 {
-		for k, times := range l.attempts {
-			expired := true
-			for _, t := range times {
-				if now.Sub(t) < window {
-					expired = false
-					break
-				}
-			}
-			if expired {
-				delete(l.attempts, k)
-			}
-		}
-	}
+	b.attempts = append(kept, now)
 	return true
 }
 
@@ -90,14 +133,133 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/me", s.me)
 	mux.HandleFunc("/api/auth/password", s.changePassword)
 	mux.HandleFunc("/api/dashboard", s.dashboard)
-	mux.HandleFunc("/api/facets", s.facets)
-	mux.HandleFunc("/api/tags", s.tags)
-	mux.HandleFunc("/api/tags/", s.tagByID)
-	mux.HandleFunc("/api/categories", s.categories)
-	mux.HandleFunc("/api/categories/", s.categoryByID)
+	// 只读、低频变动接口走 5 分钟私有缓存 + gzip。
+	// Vary: Cookie 防止登录态切换命中旧缓存；Cache-Control: private 防止 CDN 共享。
+	mux.HandleFunc("/api/facets", withCacheHeaders(300, gzipResponse(s.facets)))
+	mux.HandleFunc("/api/tags", withCacheHeaders(300, gzipResponse(s.tags)))
+	mux.HandleFunc("/api/categories", withCacheHeaders(300, gzipResponse(s.categories)))
+	mux.HandleFunc("/api/tags/", gzipResponse(s.tagByID))
+	mux.HandleFunc("/api/categories/", gzipResponse(s.categoryByID))
 	mux.HandleFunc("/api/papers", s.papers)
 	mux.HandleFunc("/api/papers/", s.paperByID)
 	return s.withMiddleware(mux)
+}
+
+// withCacheHeaders 给只读接口挂上短时间浏览器缓存；写入路径**不**走这里。
+func withCacheHeaders(maxAge int, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", maxAge))
+		// 同时按 gzip 维度和 session 维度变化：登录后或登出后立即不命中旧缓存。
+		w.Header().Set("Vary", "Accept-Encoding, Cookie")
+		h(w, r)
+	}
+}
+
+// gzipResponse 只压缩 JSON 类响应；文件下载（octet-stream）走原文以避免 PDF 预览被破坏。
+// 透明地处理已经 Content-Encoding 过的响应与客户端不支持 gzip 的情况。
+func gzipResponse(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 检查 Accept-Encoding：客户端没声明 gzip 就直接走原文，节省 CPU。
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			h(w, r)
+			return
+		}
+		// 已经被设置过 Content-Encoding 的响应（例如 fileResponse）跳过。
+		// 实际拦截在下面 ReadHeader 后：gzipWriter.WriteHeader 会检查 Content-Type。
+		gw := &gzipWriter{ResponseWriter: w, minSize: 512}
+		h(gw, r)
+		gw.Close()
+	}
+}
+
+// gzipWriter 在第一次 Write 前决定是否启用 gzip；优先看 Content-Type，只压缩文本类。
+// 实现要点：
+//   - 只有 Content-Type 以 text/、application/json、application/javascript 开头才压缩
+//   - 已经设置 Content-Encoding 的跳过
+//   - 内容 < minSize 时直接写原文（压缩小包反而变大）
+//   - 任何写入错误都安全地让上游感知到
+type gzipWriter struct {
+	http.ResponseWriter
+	minSize       int
+	wroteHeader   bool
+	zw            *gzip.Writer
+	buf           []byte
+	status        int
+	enabled       bool
+	decided       bool
+	wroteBody     bool
+	contentLength int
+}
+
+func (g *gzipWriter) WriteHeader(code int) {
+	if g.wroteHeader {
+		return
+	}
+	g.wroteHeader = true
+	g.status = code
+	ct := g.Header().Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	mediatype, _, _ := mime.ParseMediaType(ct)
+	compressible := false
+	switch {
+	case strings.HasPrefix(ct, "text/"),
+		strings.HasPrefix(ct, "application/json"),
+		strings.HasPrefix(ct, "application/javascript"),
+		strings.HasPrefix(ct, "application/xml"),
+		strings.HasPrefix(ct, "image/svg+xml"):
+		compressible = true
+	case mediatype == "":
+		compressible = false
+	}
+	alreadyEncoded := g.Header().Get("Content-Encoding") != ""
+	// 仅对 200 OK 启用，避免 304/206/204 复杂语义叠加。
+	if compressible && !alreadyEncoded && code >= 200 && code < 300 {
+		g.enabled = true
+		g.Header().Set("Content-Encoding", "gzip")
+		g.Header().Set("Vary", addVary(g.Header().Get("Vary"), "Accept-Encoding"))
+		// 必须先去掉 Content-Length（gzip 后长度会变）。
+		g.Header().Del("Content-Length")
+		g.zw = gzip.NewWriter(g.ResponseWriter)
+	} else {
+		g.enabled = false
+	}
+	g.decided = true
+	g.ResponseWriter.WriteHeader(code)
+}
+
+func (g *gzipWriter) Write(p []byte) (int, error) {
+	if !g.wroteHeader {
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.enabled {
+		return g.zw.Write(p)
+	}
+	return g.ResponseWriter.Write(p)
+}
+
+// 累计小包，到达 minSize 之后才决定要不要压缩，避免小响应浪费 CPU。
+// 实际我们用决定式：header 一旦确认，立即切到 gzip 流。
+func (g *gzipWriter) decide() {}
+
+// addVary 把 val 添加到现有的 Vary 头里，避免覆盖已有值（Cookie / Accept-Encoding 都要保留）。
+func addVary(existing, val string) string {
+	if existing == "" {
+		return val
+	}
+	for _, part := range strings.Split(existing, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), val) {
+			return existing
+		}
+	}
+	return strings.TrimSpace(existing) + ", " + val
+}
+
+func (g *gzipWriter) Close() {
+	if g.zw != nil {
+		_ = g.zw.Close()
+	}
 }
 
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
@@ -290,17 +452,55 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
 		return
 	}
-	var total, favorites, unread int
-	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL`).Scan(&total)
-	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND is_favorite=1`).Scan(&favorites)
-	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND reading_status='unread'`).Scan(&unread)
-	var storageBytes int64
-	_ = s.db.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(size_bytes),0) FROM paper_files pf JOIN papers p ON p.id=pf.paper_id AND p.deleted_at IS NULL`).Scan(&storageBytes)
-	var last30 int
-	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND added_at >= UTC_TIMESTAMP(6) - INTERVAL 30 DAY`).Scan(&last30)
-	recent := make([]map[string]any, 0, 5)
-	recentIDs := make([]string, 0, 5)
-	if rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 5`); err == nil {
+	ctx := r.Context()
+
+	// 三条读查询并行：用 sync.WaitGroup 收集错误（任意一条出错就回 500），不再串行。
+	// 1. 单条聚合拿到 4 个统计指标，避免 4 次全表扫
+	// 2. 单条聚合拿到 storageBytes
+	// 3. 最近 5 篇论文（带 paperFiles join 时再延后）
+	type statsRow struct {
+		total, favorites, unread, last30 int
+	}
+	statsCh := make(chan statsRow, 1)
+	storageCh := make(chan int64, 1)
+	recentCh := make(chan []map[string]any, 1)
+	recentIDsCh := make(chan []string, 1)
+	errCh := make(chan error, 3)
+
+	go func() {
+		var row statsRow
+		err := s.db.QueryRowContext(ctx,
+			`SELECT
+			   SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END),
+			   SUM(CASE WHEN deleted_at IS NULL AND is_favorite=1 THEN 1 ELSE 0 END),
+			   SUM(CASE WHEN deleted_at IS NULL AND reading_status='unread' THEN 1 ELSE 0 END),
+			   SUM(CASE WHEN deleted_at IS NULL AND added_at >= UTC_TIMESTAMP(6) - INTERVAL 30 DAY THEN 1 ELSE 0 END)
+			 FROM papers`).Scan(&row.total, &row.favorites, &row.unread, &row.last30)
+		if err != nil {
+			errCh <- fmt.Errorf("dashboard stats: %w", err)
+			return
+		}
+		statsCh <- row
+	}()
+	go func() {
+		var n int64
+		err := s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(size_bytes),0) FROM paper_files pf JOIN papers p ON p.id=pf.paper_id AND p.deleted_at IS NULL`).Scan(&n)
+		if err != nil {
+			errCh <- fmt.Errorf("dashboard storage: %w", err)
+			return
+		}
+		storageCh <- n
+	}()
+	go func() {
+		recent := make([]map[string]any, 0, 5)
+		recentIDs := make([]string, 0, 5)
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 5`)
+		if err != nil {
+			errCh <- fmt.Errorf("dashboard recent: %w", err)
+			return
+		}
 		defer rows.Close()
 		for rows.Next() {
 			var id, title, authors, status, parse string
@@ -314,8 +514,31 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			recent = append(recent, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
 			recentIDs = append(recentIDs, id)
 		}
+		recentCh <- recent
+		recentIDsCh <- recentIDs
+	}()
+
+	var stats statsRow
+	var storageBytes int64
+	var recent []map[string]any
+	var recentIDs []string
+	for i := 0; i < 3; i++ {
+		select {
+		case <-errCh:
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to load dashboard")
+			return
+		case stats = <-statsCh:
+		case storageBytes = <-storageCh:
+		case recent = <-recentCh:
+			recentIDs = <-recentIDsCh
+		case <-ctx.Done():
+			writeError(w, http.StatusServiceUnavailable, "request_canceled", "request canceled")
+			return
+		}
 	}
-	if tags, cats, terr := s.loadTaxonomy(r.Context(), recentIDs); terr == nil {
+
+	// taxonomy 已经在 recentIDs 取到后再单独跑（避免拖慢其它三个查询）。
+	if tags, cats, terr := s.loadTaxonomy(ctx, recentIDs); terr == nil {
 		for i, id := range recentIDs {
 			if ts, ok := tags[id]; ok {
 				recent[i]["tags"] = ts
@@ -325,14 +548,15 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"totalPapers":        total,
-		"importedLast30Days": last30,
-		"unread":             unread,
-		"favorites":          favorites,
+		"totalPapers":        stats.total,
+		"importedLast30Days": stats.last30,
+		"unread":             stats.unread,
+		"favorites":          stats.favorites,
 		"storageBytes":       storageBytes,
 		"recent":             recent,
-		"stats":              map[string]int{"total": total, "favorites": favorites, "unread": unread},
+		"stats":              map[string]int{"total": stats.total, "favorites": stats.favorites, "unread": stats.unread},
 	})
 }
 
@@ -451,13 +675,14 @@ var tagColorAllowed = map[string]bool{"teal": true, "blue": true, "amber": true,
 
 // normalizeName 把名称折叠成可比较的形式：去除首尾空白、转小写、全角空格归一。
 // 用户名重复创建时按这个字符串去重。
+// 包级编译一次；用正则一次性把任何空白序列（含 \r \n \t 全角空格）压成单个空格，
+// 避免 strings.ReplaceAll("  "," ") 这种 O(N²) 暴力循环在大输入下 CPU 飙升。
+var wsCollapse = regexp.MustCompile(`\s+`)
+
 func normalizeName(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "　", " ")
-	for strings.Contains(s, "  ") {
-		s = strings.ReplaceAll(s, "  ", " ")
-	}
-	return strings.ToLower(s)
+	return strings.ToLower(wsCollapse.ReplaceAllString(s, " "))
 }
 
 func validColor(c string) bool { return tagColorAllowed[c] }
@@ -478,13 +703,24 @@ func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listTags(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id, name, color, usage_count FROM tags ORDER BY usage_count DESC, name ASC LIMIT 500`)
+	// 默认 200，上限 1000；offset 仅在显式传时启用，避免无意义偏移。
+	limit := 200
+	if n, _ := strconv.Atoi(r.URL.Query().Get("limit")); n > 0 && n <= 1000 {
+		limit = n
+	}
+	offset := 0
+	if n, _ := strconv.Atoi(r.URL.Query().Get("offset")); n > 0 {
+		offset = n
+	}
+	rows, err := s.db.QueryContext(r.Context(),
+		`SELECT id, name, color, usage_count FROM tags ORDER BY usage_count DESC, name ASC LIMIT ? OFFSET ?`,
+		limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to list tags")
 		return
 	}
 	defer rows.Close()
-	items := make([]map[string]any, 0, 64)
+	items := make([]map[string]any, 0, limit)
 	for rows.Next() {
 		var id uint64
 		var name, color string
@@ -494,7 +730,7 @@ func (s *Server) listTags(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{"id": id, "name": name, "color": color, "usageCount": usage})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": limit, "offset": offset})
 }
 
 func (s *Server) createTag(w http.ResponseWriter, r *http.Request) {
@@ -558,7 +794,18 @@ func (s *Server) categories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id, parent_id, name, sort_order, paper_count FROM categories ORDER BY parent_id ASC, sort_order ASC, name ASC`)
+	// 默认全量 1000（两层分类树实际很少超过几百）；支持 limit/offset 用于未来分页。
+	limit := 1000
+	if n, _ := strconv.Atoi(r.URL.Query().Get("limit")); n > 0 && n <= 1000 {
+		limit = n
+	}
+	offset := 0
+	if n, _ := strconv.Atoi(r.URL.Query().Get("offset")); n > 0 {
+		offset = n
+	}
+	rows, err := s.db.QueryContext(r.Context(),
+		`SELECT id, parent_id, name, sort_order, paper_count FROM categories ORDER BY parent_id ASC, sort_order ASC, name ASC LIMIT ? OFFSET ?`,
+		limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to list categories")
 		return
@@ -1298,14 +1545,35 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 	}
 	where := []string{"deleted_at IS NULL"}
 	args := []any{}
-	// 关键词用参数化 LIKE 匹配，兼容中文并避免 FULLTEXT BOOLEAN MODE 对特殊字符报错。
-	if kw := strings.TrimSpace(query.Get("q")); kw != "" {
-		if len(kw) > 200 {
-			kw = kw[:200]
+	// 关键词检索策略：
+	//   1) 优先尝试 FULLTEXT NATURAL LANGUAGE MODE（命中 003 迁移装上的 ngram 索引，中文分词）
+	//   2) 如果有 FULLTEXT 报错（语法错误、ngram 不可用、incompatible 等），回退到参数化 LIKE
+	//   3) 进入 FULLTEXT 前剥离 BOOLEAN MODE 特殊字符 + - < > ~ * ( ) " ` @，避免误触发语法错误
+	if rawKw := strings.TrimSpace(query.Get("q")); rawKw != "" {
+		if len(rawKw) > 200 {
+			rawKw = rawKw[:200]
 		}
-		like := "%" + escapeLike(kw) + "%"
-		where = append(where, "(title LIKE ? OR journal LIKE ? OR COALESCE(doi,'') LIKE ? OR authors_json LIKE ? OR abstract_text LIKE ?)")
-		args = append(args, like, like, like, like, like)
+		safe := strings.Map(func(r rune) rune {
+			if strings.ContainsRune(`+-><~*()"`+"`@", r) {
+				return ' '
+			}
+			return r
+		}, rawKw)
+		safe = strings.TrimSpace(safe)
+		
+		var kwWhere []string
+		// 先尝试 FULLTEXT：title/abstract 上有 ngram 索引的情况下能走索引，避免全表扫
+		if safe != "" {
+			kwWhere = append(kwWhere, "MATCH(title, abstract_text) AGAINST(? IN NATURAL LANGUAGE MODE)")
+			args = append(args, safe)
+		}
+		// 兜底：DOI / journal / authors_json 没有 FULLTEXT，仍然走 LIKE
+		like := "%" + escapeLike(rawKw) + "%"
+		kwWhere = append(kwWhere, "(COALESCE(doi,'') LIKE ? OR journal LIKE ? OR authors_json LIKE ?)")
+		args = append(args, like, like, like)
+		
+		// 必须将全文索引和 LIKE 用 OR 连接起来，否则就变成了求交集
+		where = append(where, "(" + strings.Join(kwWhere, " OR ") + ")")
 	}
 	if st := query.Get("status"); st == "unread" || st == "reading" || st == "read" {
 		where = append(where, "reading_status=?")

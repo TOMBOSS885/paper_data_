@@ -23,6 +23,8 @@ func Open(dsn string) (*sql.DB, error) {
 	database.SetMaxOpenConns(20)
 	database.SetMaxIdleConns(10)
 	database.SetConnMaxLifetime(5 * time.Minute)
+	// 闲置连接超过这个时间会被关掉，避免 MySQL 服务端 wait_timeout 主动断开后客户端还在用陈旧 socket。
+	database.SetConnMaxIdleTime(2 * time.Minute)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := database.PingContext(ctx); err != nil {
