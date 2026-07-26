@@ -1998,12 +1998,15 @@ func (s *Server) patchPaper(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	var req struct {
-		Version       int     `json:"version"`
-		Title         *string `json:"title"`
-		Abstract      *string `json:"abstract"`
-		DOI           *string `json:"doi"`
-		ReadingStatus *string `json:"readingStatus"`
-		IsFavorite    *bool   `json:"isFavorite"`
+		Version       int       `json:"version"`
+		Title         *string   `json:"title"`
+		Abstract      *string   `json:"abstract"`
+		DOI           *string   `json:"doi"`
+		ReadingStatus *string   `json:"readingStatus"`
+		IsFavorite    *bool     `json:"isFavorite"`
+		Authors       *[]string `json:"authors"`
+		Journal       *string   `json:"journal"`
+		Year          *int      `json:"year"`
 	}
 	if !decodeJSON(w, r, &req) || req.Version < 1 {
 		return
@@ -2033,6 +2036,24 @@ func (s *Server) patchPaper(w http.ResponseWriter, r *http.Request, id string) {
 	if req.IsFavorite != nil {
 		sets = append(sets, "is_favorite=?")
 		args = append(args, *req.IsFavorite)
+	}
+	if req.Authors != nil {
+		if b, err := json.Marshal(*req.Authors); err == nil {
+			sets = append(sets, "authors_json=?")
+			args = append(args, string(b))
+		}
+	}
+	if req.Journal != nil {
+		sets = append(sets, "journal=?")
+		args = append(args, *req.Journal)
+	}
+	if req.Year != nil {
+		sets = append(sets, "published_at=?")
+		if *req.Year > 0 {
+			args = append(args, fmt.Sprintf("%04d-01-01", *req.Year))
+		} else {
+			args = append(args, nil)
+		}
 	}
 	if len(sets) == 0 {
 		writeError(w, 400, "invalid_request", "no fields to update")

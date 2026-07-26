@@ -855,7 +855,7 @@ function PaperDetailPage() {
   const { id = '' } = useParams()
   const nav = useNavigate()
   const [data, setData] = useState<PaperDetail | null>(null)
-  const [form, setForm] = useState({ title: '', abstract: '', doi: '', readingStatus: 'unread' })
+  const [form, setForm] = useState({ title: '', abstract: '', doi: '', readingStatus: 'unread', authorsStr: '', journal: '', year: '' })
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
@@ -876,7 +876,15 @@ function PaperDetailPage() {
 
   const apply = (detail: PaperDetail) => {
     setData(detail)
-    setForm({ title: detail.title ?? '', abstract: detail.abstract ?? '', doi: detail.doi ?? '', readingStatus: detail.readingStatus ?? 'unread' })
+    setForm({ 
+      title: detail.title ?? '', 
+      abstract: detail.abstract ?? '', 
+      doi: detail.doi ?? '', 
+      readingStatus: detail.readingStatus ?? 'unread',
+      authorsStr: (detail.authors || []).map(a => typeof a === 'string' ? a : a.name).join(', '),
+      journal: detail.journal ?? '',
+      year: detail.year ? detail.year.toString() : ''
+    })
     setSelectedTagIDs((detail.tags ?? []).map((t) => t.id))
     setSelectedCategoryIDs((detail.categories ?? []).map((c) => c.id))
   }
@@ -999,6 +1007,9 @@ function PaperDetailPage() {
         <div className="panel">
           <div className="panel-head"><h2>元数据</h2></div>
           <label className="field">标题<input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label>
+          <label className="field">作者 (逗号分隔)<input value={form.authorsStr} onChange={(e) => setForm({ ...form, authorsStr: e.target.value })} placeholder="John Doe, Jane Smith" /></label>
+          <label className="field">期刊 / 会议<input value={form.journal} onChange={(e) => setForm({ ...form, journal: e.target.value })} placeholder="Nature" /></label>
+          <label className="field">发表年份<input type="number" value={form.year} onChange={(e) => setForm({ ...form, year: e.target.value })} placeholder="2023" /></label>
           <label className="field">DOI<input value={form.doi} onChange={(e) => setForm({ ...form, doi: e.target.value })} placeholder="10.xxxx/xxxxx" /></label>
           <label className="field">
             阅读状态
@@ -1010,7 +1021,15 @@ function PaperDetailPage() {
           </label>
           <label className="field">摘要 / 笔记<textarea rows={9} value={form.abstract} onChange={(e) => setForm({ ...form, abstract: e.target.value })} placeholder="粘贴摘要，或记录自己的阅读笔记" /></label>
           <div className="import-actions">
-            <button className="button primary" disabled={busy} onClick={() => patch({ title: form.title.trim() || data.title, doi: form.doi.trim(), abstract: form.abstract, readingStatus: form.readingStatus }, '已保存')}>
+            <button className="button primary" disabled={busy} onClick={() => patch({ 
+              title: form.title.trim() || data.title, 
+              authors: form.authorsStr.split(',').map(s => s.trim()).filter(Boolean),
+              journal: form.journal.trim(),
+              year: parseInt(form.year) || null,
+              doi: form.doi.trim(), 
+              abstract: form.abstract, 
+              readingStatus: form.readingStatus 
+            }, '已保存')}>
               <Save size={16} />{busy ? '保存中…' : '保存修改'}
             </button>
             <button className="button secondary" disabled={busy} onClick={async () => {
