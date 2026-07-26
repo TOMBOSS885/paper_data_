@@ -229,23 +229,31 @@ func decodeString(raw []byte) (string, bool) {
 		allHex = false
 		break
 	}
+	var decoded []byte
 	if allHex && len(raw)%2 == 0 {
-		decoded, err := hex.DecodeString(string(raw))
+		var err error
+		decoded, err = hex.DecodeString(string(raw))
 		if err != nil {
 			return "", false
 		}
-		// BOM 嗅探：UTF-16BE 以 0xFE 0xFF 开头
-		if len(decoded) >= 2 && decoded[0] == 0xFE && decoded[1] == 0xFF {
-			u16 := make([]uint16, (len(decoded)-2)/2)
-			for i := range u16 {
+	} else {
+		decoded = []byte(unescapePDFLiteral(raw))
+	}
+
+	// BOM 嗅探：UTF-16BE 以 0xFE 0xFF 开头
+	if len(decoded) >= 2 && decoded[0] == 0xFE && decoded[1] == 0xFF {
+		u16 := make([]uint16, (len(decoded)-2)/2)
+		for i := range u16 {
+			if 2+2*i+1 < len(decoded) {
 				u16[i] = uint16(decoded[2+2*i])<<8 | uint16(decoded[2+2*i+1])
 			}
-			return string(utf16.Decode(u16)), true
 		}
-		return string(decoded), true
+		return string(utf16.Decode(u16)), true
 	}
-	// Literal: 可能包含转义 \\( \\) \\n 等；保留原文（BMP 安全）。
-	return unescapePDFLiteral(raw), true
+	
+	// PDF 中非 UTF-16 的字符串可能是 PDFDocEncoding (类似 Latin1)
+	// 为防止存入 MySQL 时因非法字节导致 Incorrect string value，清理为合法的 UTF-8
+	return strings.ToValidUTF8(string(decoded), ""), true
 }
 
 // unescapePDFLiteral 处理 PDF literal string 的反斜杠转义。
