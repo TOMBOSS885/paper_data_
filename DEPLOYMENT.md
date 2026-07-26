@@ -123,6 +123,50 @@ docker run --rm -v paper-knowledge-base_paper_uploads:/data -v $(pwd):/backup al
   tar czf /backup/uploads_$(date +%F).tar.gz -C /data .              # 上传的论文文件
 ```
 
+## 六点五、怎么看日志（排查第一步）
+
+进入项目目录（服务器上是 `/home/www/paper_data_`）执行：
+
+```bash
+cd /home/www/paper_data_
+
+# 1. 先看两个容器是否都在 running
+docker compose --env-file .env -f deploy/docker-compose.yml ps
+
+# 2. 后端日志：接口报错、数据库连接、迁移都在这里
+docker compose --env-file .env -f deploy/docker-compose.yml logs -f --tail=200 api
+
+# 3. 前端/反代日志：能看到每个请求的状态码（499/502/404 都在这里）
+docker compose --env-file .env -f deploy/docker-compose.yml logs -f --tail=200 web
+
+# 4. 两个一起看
+docker compose --env-file .env -f deploy/docker-compose.yml logs -f --tail=100
+```
+
+也可以直接用容器名（`docker ps` 查看实际名字，通常是 `paper_data_-api-1`）：
+
+```bash
+docker logs -f --tail=200 paper_data_-api-1
+docker logs --since 10m paper_data_-api-1        # 只看最近 10 分钟
+docker logs paper_data_-api-1 2>&1 | grep -i error
+```
+
+直接命中后端做健康检查（绕过 nginx，确认是前端还是后端问题）：
+
+```bash
+curl -i http://127.0.0.1:8089/api/health        # 8089 换成 .env 里的 API_PORT
+curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_PORT，走 nginx
+```
+
+**页面上按钮点了没反应时，最快的定位方式是浏览器端**：按 `F12` 打开开发者工具 →
+- **Console** 标签：有红色报错说明是前端 JS 问题；
+- **Network** 标签：点一次按钮，看有没有发出 `/api/...` 请求。
+  - 没有请求 → 该控件没绑定行为或路由不存在；
+  - 有请求但是 `401` → 会话失效，重新登录；
+  - `403` → CSRF 校验失败，清掉站点 Cookie 重新登录；
+  - `404`/`502` → 反向代理或后端没起来，回到上面的 `logs api`；
+  - `500` → 后端异常，日志里搜同一时间的 `requestId`（响应头 `X-Request-ID` 与日志一致）。
+
 ## 七、常见问题
 
 **api 容器反复重启，日志显示 `connect mysql: ...`**

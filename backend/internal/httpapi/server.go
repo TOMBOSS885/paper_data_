@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -87,7 +88,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/login", s.login)
 	mux.HandleFunc("/api/auth/logout", s.logout)
 	mux.HandleFunc("/api/auth/me", s.me)
+	mux.HandleFunc("/api/auth/password", s.changePassword)
 	mux.HandleFunc("/api/dashboard", s.dashboard)
+	mux.HandleFunc("/api/facets", s.facets)
 	mux.HandleFunc("/api/papers", s.papers)
 	mux.HandleFunc("/api/papers/", s.paperByID)
 	return s.withMiddleware(mux)
@@ -260,6 +263,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.db.ExecContext(r.Context(), `UPDATE sessions SET revoked_at=UTC_TIMESTAMP(6) WHERE token_hash=?`, s.secureHash(token.Value))
 	}
 	http.SetCookie(w, &http.Cookie{Name: "pkb_session", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "pkb_csrf", Path: "/", MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
@@ -288,14 +292,134 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND reading_status='unread'`).Scan(&unread)
 	var storageBytes int64
 	_ = s.db.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(size_bytes),0) FROM paper_files pf JOIN papers p ON p.id=pf.paper_id AND p.deleted_at IS NULL`).Scan(&storageBytes)
+	var last30 int
+	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND added_at >= UTC_TIMESTAMP(6) - INTERVAL 30 DAY`).Scan(&last30)
+	recent := make([]map[string]any, 0, 5)
+	if rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 5`); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id, title, authors, status, parse string
+			var doi, journal sql.NullString
+			var published sql.NullTime
+			var fav bool
+			var added, updated time.Time
+			if err := rows.Scan(&id, &title, &authors, &doi, &journal, &published, &status, &fav, &parse, &added, &updated); err != nil {
+				continue
+			}
+			recent = append(recent, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"totalPapers":        total,
-		"importedLast30Days": 0,
+		"importedLast30Days": last30,
 		"unread":             unread,
+		"favorites":          favorites,
 		"storageBytes":       storageBytes,
-		"recent":             []any{},
+		"recent":             recent,
 		"stats":              map[string]int{"total": total, "favorites": favorites, "unread": unread},
 	})
+}
+
+// facets 提供分类浏览页需要的聚合数据（按年份、期刊、阅读状态统计）。
+func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(r); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	years := make([]map[string]any, 0, 20)
+	if rows, err := s.db.QueryContext(r.Context(), `SELECT YEAR(published_at) AS y, COUNT(*) FROM papers WHERE deleted_at IS NULL AND published_at IS NOT NULL GROUP BY y ORDER BY y DESC LIMIT 24`); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var y, c int
+			if err := rows.Scan(&y, &c); err == nil {
+				years = append(years, map[string]any{"year": y, "count": c})
+			}
+		}
+	}
+	journals := make([]map[string]any, 0, 12)
+	if rows, err := s.db.QueryContext(r.Context(), `SELECT journal, COUNT(*) AS c FROM papers WHERE deleted_at IS NULL AND journal <> '' GROUP BY journal ORDER BY c DESC, journal ASC LIMIT 12`); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var c int
+			if err := rows.Scan(&name, &c); err == nil {
+				journals = append(journals, map[string]any{"name": name, "count": c})
+			}
+		}
+	}
+	statuses := map[string]int{"unread": 0, "reading": 0, "read": 0}
+	if rows, err := s.db.QueryContext(r.Context(), `SELECT reading_status, COUNT(*) FROM papers WHERE deleted_at IS NULL GROUP BY reading_status`); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var c int
+			if err := rows.Scan(&name, &c); err == nil {
+				statuses[name] = c
+			}
+		}
+	}
+	var favorites, missingYear int
+	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND is_favorite=1`).Scan(&favorites)
+	_ = s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE deleted_at IS NULL AND published_at IS NULL`).Scan(&missingYear)
+	writeJSON(w, http.StatusOK, map[string]any{"years": years, "journals": journals, "statuses": statuses, "favorites": favorites, "missingYear": missingYear})
+}
+
+// changePassword 修改管理员密码，成功后吊销全部会话（含当前会话），前端需重新登录。
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.NewPassword) < 12 || len(req.NewPassword) > 256 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "new password must be 12-256 characters")
+		return
+	}
+	if req.NewPassword == req.CurrentPassword {
+		writeError(w, http.StatusBadRequest, "invalid_request", "new password must differ from the current one")
+		return
+	}
+	if !s.limiter.allow(fmt.Sprintf("password:%d", id), 5, 15*time.Minute) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many attempts, please retry later")
+		return
+	}
+	var hash string
+	if err := s.db.QueryRowContext(r.Context(), `SELECT password_hash FROM admins WHERE id=?`, id).Scan(&hash); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.CurrentPassword)) != nil {
+		writeError(w, http.StatusForbidden, "invalid_credentials", "current password is incorrect")
+		return
+	}
+	next, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to secure password")
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `UPDATE admins SET password_hash=?, password_changed_at=UTC_TIMESTAMP(6), updated_at=UTC_TIMESTAMP(6), token_version=token_version+1, failed_login_attempts=0, locked_until=NULL WHERE id=?`, string(next), id); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update password")
+		return
+	}
+	_, _ = s.db.ExecContext(r.Context(), `UPDATE sessions SET revoked_at=UTC_TIMESTAMP(6) WHERE admin_id=? AND revoked_at IS NULL`, id)
+	http.SetCookie(w, &http.Cookie{Name: "pkb_session", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "pkb_csrf", Path: "/", MaxAge: -1})
+	writeJSON(w, http.StatusOK, map[string]any{"passwordChanged": true, "sessionsRevoked": true})
 }
 
 func (s *Server) papers(w http.ResponseWriter, r *http.Request) {
@@ -314,22 +438,63 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "unauthenticated", "authentication required")
 		return
 	}
+	query := r.URL.Query()
 	pageSize := 20
-	if n, _ := strconv.Atoi(r.URL.Query().Get("pageSize")); n > 0 {
+	if n, _ := strconv.Atoi(query.Get("pageSize")); n > 0 {
 		pageSize = n
 	}
 	if pageSize > s.cfg.SearchMaxPageSize {
 		pageSize = s.cfg.SearchMaxPageSize
 	}
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	args := []any{}
-	where := "deleted_at IS NULL"
-	if q != "" {
-		where += " AND MATCH(title, abstract_text) AGAINST(? IN BOOLEAN MODE)"
-		args = append(args, q)
+	page := 1
+	if n, _ := strconv.Atoi(query.Get("page")); n > 1 {
+		page = n
 	}
-	args = append(args, pageSize)
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE `+where+` ORDER BY added_at DESC LIMIT ?`, args...)
+	where := []string{"deleted_at IS NULL"}
+	args := []any{}
+	// 关键词用参数化 LIKE 匹配，兼容中文并避免 FULLTEXT BOOLEAN MODE 对特殊字符报错。
+	if kw := strings.TrimSpace(query.Get("q")); kw != "" {
+		if len(kw) > 200 {
+			kw = kw[:200]
+		}
+		like := "%" + escapeLike(kw) + "%"
+		where = append(where, "(title LIKE ? OR journal LIKE ? OR COALESCE(doi,'') LIKE ? OR authors_json LIKE ? OR abstract_text LIKE ?)")
+		args = append(args, like, like, like, like, like)
+	}
+	if st := query.Get("status"); st == "unread" || st == "reading" || st == "read" {
+		where = append(where, "reading_status=?")
+		args = append(args, st)
+	}
+	if query.Get("favorite") == "true" {
+		where = append(where, "is_favorite=1")
+	}
+	if y, err := strconv.Atoi(query.Get("yearFrom")); err == nil && y >= 1000 && y <= 3000 {
+		where = append(where, "published_at >= ?")
+		args = append(args, fmt.Sprintf("%04d-01-01", y))
+	}
+	if y, err := strconv.Atoi(query.Get("yearTo")); err == nil && y >= 1000 && y <= 3000 {
+		where = append(where, "published_at <= ?")
+		args = append(args, fmt.Sprintf("%04d-12-31", y))
+	}
+	order := "added_at DESC"
+	switch query.Get("sort") {
+	case "oldest":
+		order = "added_at ASC"
+	case "title":
+		order = "title ASC"
+	case "year":
+		order = "published_at IS NULL, published_at DESC, added_at DESC"
+	case "updated":
+		order = "updated_at DESC"
+	}
+	clause := strings.Join(where, " AND ")
+	var total int
+	if err := s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE `+clause, args...).Scan(&total); err != nil {
+		writeError(w, 500, "internal_error", "unable to query papers")
+		return
+	}
+	listArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE `+clause+` ORDER BY `+order+` LIMIT ? OFFSET ?`, listArgs...)
 	if err != nil {
 		writeError(w, 500, "internal_error", "unable to query papers")
 		return
@@ -345,11 +510,37 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&id, &title, &authors, &doi, &journal, &published, &status, &fav, &parse, &added, &updated); err != nil {
 			continue
 		}
-		var authorList any
-		_ = json.Unmarshal([]byte(authors), &authorList)
-		items = append(items, map[string]any{"id": id, "title": title, "authors": authorList, "doi": doi.String, "journal": journal.String, "publishedAt": published, "readingStatus": status, "isFavorite": fav, "parseStatus": parse, "addedAt": added, "updatedAt": updated})
+		items = append(items, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
 	}
-	writeJSON(w, 200, map[string]any{"items": items, "page": 1, "pageSize": pageSize, "total": len(items), "nextCursor": nil})
+	if err := rows.Err(); err != nil {
+		writeError(w, 500, "internal_error", "unable to query papers")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// paperSummary 统一列表与概览的论文字段，前端依赖 year 直接展示发表年份。
+func paperSummary(id, title, authors string, doi, journal sql.NullString, published sql.NullTime, status, parse string, fav bool, added, updated time.Time) map[string]any {
+	var authorList any
+	if err := json.Unmarshal([]byte(authors), &authorList); err != nil {
+		authorList = []any{}
+	}
+	var year any
+	if published.Valid {
+		year = published.Time.Year()
+	}
+	return map[string]any{
+		"id": id, "title": title, "authors": authorList, "doi": doi.String, "journal": journal.String,
+		"year": year, "readingStatus": status, "isFavorite": fav, "parseStatus": parse,
+		"addedAt": added, "updatedAt": updated,
+	}
+}
+
+// escapeLike 转义 LIKE 通配符，避免用户输入的 % 和 _ 变成模糊匹配。
+func escapeLike(v string) string {
+	v = strings.ReplaceAll(v, "\\", "\\\\")
+	v = strings.ReplaceAll(v, "%", "\\%")
+	return strings.ReplaceAll(v, "_", "\\_")
 }
 
 func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
@@ -375,23 +566,31 @@ func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request", "files is required")
 		return
 	}
+	// 逐个文件汇报结果，单个文件失败不影响其余文件入库。
 	items := make([]map[string]any, 0, len(files))
+	accepted := 0
 	for _, fh := range files {
 		item, err := s.saveUpload(r.Context(), fh)
 		if err != nil {
-			writeError(w, 400, "unsupported_media_type", err.Error())
-			return
+			items = append(items, map[string]any{"filename": fh.Filename, "status": "rejected", "reason": err.Error()})
+			continue
 		}
+		accepted++
 		items = append(items, item)
 	}
-	writeJSON(w, 202, map[string]any{"jobId": uuid.NewString(), "items": items})
+	if accepted == 0 {
+		reason, _ := items[0]["reason"].(string)
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", reason)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"jobId": uuid.NewString(), "accepted": accepted, "rejected": len(items) - accepted, "items": items})
 }
 func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[string]any, error) {
 	if fh.Size <= 0 || fh.Size > s.cfg.UploadMaxBytes {
 		return nil, fmt.Errorf("file size is not allowed")
 	}
 	ext := strings.ToLower(filepath.Ext(fh.Filename))
-	allowed := map[string]bool{".pdf": true, ".docx": true, ".doc": true, ".odt": true, ".tex": true, ".txt": true, ".html": true}
+	allowed := map[string]bool{".pdf": true, ".docx": true, ".doc": true, ".odt": true, ".tex": true, ".txt": true}
 	if !allowed[ext] {
 		return nil, fmt.Errorf("unsupported file type")
 	}
@@ -448,9 +647,15 @@ func (s *Server) paperByID(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) > 1 {
 		if parts[1] == "download" || parts[1] == "preview" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
 			s.fileResponse(w, r, parts[0])
 			return
 		}
+		writeError(w, 404, "not_found", "paper not found")
+		return
 	}
 	if r.Method == http.MethodGet {
 		s.getPaper(w, r, parts[0])
@@ -473,17 +678,24 @@ func (s *Server) getPaper(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	var title, abstract, authors, status, parse string
 	var doi, journal sql.NullString
+	var published sql.NullTime
 	var version int
 	var fav bool
 	var added, updated time.Time
-	err := s.db.QueryRowContext(r.Context(), `SELECT title,abstract_text,authors_json,doi,journal,reading_status,is_favorite,parse_status,version,added_at,updated_at FROM papers WHERE id=? AND deleted_at IS NULL`, id).Scan(&title, &abstract, &authors, &doi, &journal, &status, &fav, &parse, &version, &added, &updated)
+	err := s.db.QueryRowContext(r.Context(), `SELECT title,abstract_text,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,version,added_at,updated_at FROM papers WHERE id=? AND deleted_at IS NULL`, id).Scan(&title, &abstract, &authors, &doi, &journal, &published, &status, &fav, &parse, &version, &added, &updated)
 	if err != nil {
 		writeError(w, 404, "not_found", "paper not found")
 		return
 	}
-	var a any
-	_ = json.Unmarshal([]byte(authors), &a)
-	writeJSON(w, 200, map[string]any{"id": id, "title": title, "abstract": abstract, "authors": a, "doi": doi.String, "journal": journal.String, "readingStatus": status, "isFavorite": fav, "parseStatus": parse, "version": version, "addedAt": added, "updatedAt": updated})
+	item := paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated)
+	item["abstract"] = abstract
+	item["version"] = version
+	var fileName, mediaType, objectKey string
+	var fileSize int64
+	if err := s.db.QueryRowContext(r.Context(), `SELECT original_name,media_type,object_key,size_bytes FROM paper_files WHERE paper_id=? ORDER BY created_at DESC LIMIT 1`, id).Scan(&fileName, &mediaType, &objectKey, &fileSize); err == nil {
+		item["file"] = map[string]any{"originalName": fileName, "mediaType": mediaType, "sizeBytes": fileSize, "previewable": strings.HasSuffix(strings.ToLower(objectKey), ".pdf")}
+	}
+	writeJSON(w, 200, item)
 }
 func (s *Server) patchPaper(w http.ResponseWriter, r *http.Request, id string) {
 	if _, ok := s.authenticate(r); !ok {
@@ -575,18 +787,48 @@ func (s *Server) fileResponse(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	defer f.Close()
-	w.Header().Set("Content-Type", media)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, 404, "not_found", "paper file not found")
+		return
+	}
+	isPDF := strings.HasSuffix(strings.ToLower(key), ".pdf")
 	disp := "attachment"
 	if strings.HasSuffix(r.URL.Path, "/preview") {
-		if !strings.EqualFold(media, "application/pdf") || !strings.HasSuffix(strings.ToLower(key), ".pdf") {
+		// 只允许内联预览服务端已校验过魔数的 PDF，其它类型必须下载。
+		if !isPDF {
 			writeError(w, http.StatusUnsupportedMediaType, "preview_not_supported", "this file type must be downloaded")
 			return
 		}
 		disp = "inline"
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disp, strings.ReplaceAll(name, "\"", "")))
-	io.Copy(w, f)
+	if isPDF {
+		media = "application/pdf"
+	} else if media == "" {
+		media = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", media)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-store")
+	// 文件名只保留安全字符，中文等非 ASCII 用 RFC 5987 的 filename* 传递。
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"; filename*=UTF-8''%s`, disp, asciiFilename(name), url.PathEscape(name)))
+	http.ServeContent(w, r, name, info.ModTime(), f)
+}
+
+// asciiFilename 去掉 Content-Disposition 中不安全或非 ASCII 的字符，避免响应头注入。
+func asciiFilename(name string) string {
+	var b strings.Builder
+	for _, ch := range name {
+		if ch < 32 || ch > 126 || ch == '"' || ch == '\\' || ch == ';' {
+			b.WriteByte('_')
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	if b.Len() == 0 {
+		return "download"
+	}
+	return b.String()
 }
 
 func (s *Server) isInitialized(ctx context.Context) (bool, error) {
