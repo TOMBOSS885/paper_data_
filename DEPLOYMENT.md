@@ -8,11 +8,13 @@
 
 ## 架构
 
+两个容器都运行在**宿主机网络**（`network_mode: host`）上，因此连接本机 MySQL 走 `127.0.0.1` 回环——**不需要修改 MySQL 的 bind-address，也不需要调整防火墙**。
+
 ```
-浏览器 ──> web 容器 (Nginx, 宿主机 HTTP_PORT -> 8080)
+浏览器 ──> web 容器 (Nginx, 监听 0.0.0.0:HTTP_PORT)
               ├── 静态前端 (React)
-              └── /api/ 反向代理 ──> api 容器 (Go, 8080)
-                                        └── 直连服务器 MySQL (host.docker.internal:3306)
+              └── /api/ 反向代理 ──> api 容器 (Go, 仅监听 127.0.0.1:API_PORT)
+                                        └── 直连本机 MySQL (127.0.0.1:3306)
 上传的论文文件保存在 Docker 卷 paper_uploads 中
 ```
 
@@ -20,27 +22,27 @@
 
 1. 服务器已安装 **Docker Engine 24+** 和 **Docker Compose v2**（`docker compose version` 能正常输出）。
 2. 服务器上已运行 **MySQL 8.0+**（宝塔面板、系统包安装或另一台数据库服务器均可）。
-3. 开放防火墙的 `HTTP_PORT`（默认 80）端口；**不要**把 3306 开放到公网。
+3. 宿主机的 `HTTP_PORT`（默认 80）和 `API_PORT`（默认 8080）未被其他服务占用（`ss -tlnp | grep -E ':80|:8080'` 检查；被占用就在 `.env` 里换端口）。
 
 ## 二、准备 MySQL
 
-MySQL 需要能被 Docker 网桥访问。若 MySQL 与本项目在同一台服务器：
-
-1. 将 MySQL 的 `bind-address` 设置为 `0.0.0.0` 或服务器内网地址（宝塔：数据库 → 配置修改；或编辑 `/etc/my.cnf`），重启 MySQL。
-2. 创建数据库和仅允许 Docker 子网访问的账号：
+由于容器使用宿主机网络，MySQL 保持默认的 `127.0.0.1` 监听即可，只需创建数据库和本机账号：
 
 ```sql
 CREATE DATABASE IF NOT EXISTS paper_kb
   CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS 'paper_kb_app'@'172.30.0.%'
+CREATE USER IF NOT EXISTS 'paper_kb_app'@'localhost'
   IDENTIFIED BY '一个强密码（与 .env 中 MYSQL_PASSWORD 一致）';
-GRANT ALL PRIVILEGES ON paper_kb.* TO 'paper_kb_app'@'172.30.0.%';
+CREATE USER IF NOT EXISTS 'paper_kb_app'@'127.0.0.1'
+  IDENTIFIED BY '同一个密码';
+GRANT ALL PRIVILEGES ON paper_kb.* TO 'paper_kb_app'@'localhost';
+GRANT ALL PRIVILEGES ON paper_kb.* TO 'paper_kb_app'@'127.0.0.1';
 FLUSH PRIVILEGES;
 ```
 
-> `172.30.0.%` 对应 `.env` 中的 `DOCKER_SUBNET=172.30.0.0/24`。若该网段与现有网络冲突，请同时修改 `DOCKER_SUBNET` 和 MySQL 账号的来源网段。
+> 用宝塔面板建库时，账号的"访问权限"选 **本地服务器（localhost）** 即可。
 >
-> 若 MySQL 在**另一台服务器**上，把来源网段换成本机的出口 IP，并在 `.env` 中把 `MYSQL_HOST` 填成那台服务器的 IP。
+> 若 MySQL 在**另一台服务器**上，在 `.env` 中把 `MYSQL_HOST` 填成那台服务器的 IP，并把账号来源改成本机的出口 IP。
 
 ## 三、配置 .env
 
@@ -68,8 +70,9 @@ openssl rand -base64 48
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HTTP_PORT` | `80` | 对外服务端口 |
-| `MYSQL_HOST` | `host.docker.internal` | MySQL 在本机时保持默认；在其他服务器时填其 IP |
+| `HTTP_PORT` | `80` | Web 对外服务端口（宝塔/Nginx 反代时填反代目标端口） |
+| `API_PORT` | `8080` | API 监听端口，仅绑定 `127.0.0.1` 不对外暴露；与其他项目冲突时修改 |
+| `MYSQL_HOST` | `127.0.0.1` | MySQL 在本机时保持默认；在其他服务器时填其 IP |
 | `COOKIE_SECURE` | `false` | 通过 HTTPS 域名访问时改为 `true`；用 `http://IP` 访问时必须保持 `false`，否则浏览器不回传 Cookie、无法登录 |
 | `GO_IMAGE` 等 | Docker Hub 官方镜像 | 国内服务器拉取超时时换成镜像加速地址，如 `镜像加速域名/library/golang:1.22-alpine` |
 | `AUTO_MIGRATE` | `true` | 启动时自动执行版本化数据库迁移（已应用的版本会跳过） |
@@ -123,9 +126,9 @@ docker run --rm -v paper-knowledge-base_paper_uploads:/data -v $(pwd):/backup al
 ## 七、常见问题
 
 **api 容器反复重启，日志显示 `connect mysql: ...`**
-- MySQL 的 `bind-address` 仍是 `127.0.0.1` → 改为 `0.0.0.0` 后重启 MySQL；
-- 账号来源网段不对 → 确认用户是 `'paper_kb_app'@'172.30.0.%'` 且密码与 `.env` 一致；
-- 服务器防火墙拦截了 Docker 子网 → 放行 `172.30.0.0/24` 访问 3306。
+- `connection refused` → 本机 MySQL 没在运行或端口不是 3306（`ss -tlnp | grep 3306` 检查）；
+- `Access denied` → 账号/密码不对，确认存在 `'paper_kb_app'@'localhost'`（或 `'127.0.0.1'`/`'%'`）且密码与 `.env` 一致；
+- `Unknown database` → 数据库还没建，按第二节执行建库 SQL。
 
 **能打开页面但登录后立刻退回登录页**
 - 用 `http://IP` 访问时 `.env` 中 `COOKIE_SECURE` 必须为 `false`（改完后 `bash deploy.sh` 重新部署）。
@@ -162,8 +165,11 @@ docker run --rm -v paper-knowledge-base_paper_uploads:/data -v $(pwd):/backup al
   ```
 - 仍不通则检查防火墙是否拦截了 Docker 网桥的出站 UDP 53（`ufw status`；必要时 `ufw allow out 53/udp`，或将 `/etc/default/ufw` 的 `DEFAULT_FORWARD_POLICY` 改为 `ACCEPT` 后 `ufw reload`）。
 
-**80 端口被占用**
-- 修改 `.env` 中 `HTTP_PORT`（如 8081）后重跑脚本，访问 `http://IP:8081`。
+**80 或 8080 端口被占用（容器起不来 / `bind: address already in use`）**
+- 容器用宿主机网络，`HTTP_PORT` 和 `API_PORT` 都实际占用宿主机端口。修改 `.env` 中对应端口后重跑脚本。
+
+**部署成功但外网打不开页面**
+- 宿主机防火墙（ufw/宝塔安全页）没放行 `HTTP_PORT`。推荐做法：不开端口，直接在宝塔给域名建站点开 HTTPS，反向代理到 `http://127.0.0.1:HTTP_PORT`（回环流量不受防火墙限制）；或临时 `ufw allow HTTP_PORT/tcp` 用 IP 直连测试。
 
 ## 八、安全建议
 

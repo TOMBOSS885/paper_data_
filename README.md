@@ -6,7 +6,7 @@ React + Go + MySQL 的单管理员论文知识库。部署步骤见 [`DEPLOYMENT
 
 - Go API：健康检查、一次性初始化（SETUP_SECRET）、邮箱 + 密码登录、Cookie 会话、CSRF、论文列表/全文查询、上传、详情、乐观锁更新、预览/下载、软删除、Dashboard。
 - React：`/setup`、登录、Dashboard、论文库、导入、分类标签基础工作区；使用 HttpOnly Cookie 和自动 CSRF 头。
-- Docker：`deploy/docker-compose.yml` 包含 API 和 Web 两个容器；API 通过 Docker host gateway 按 `.env` 中的配置直连服务器 MySQL，Web(Nginx) 托管前端并反代 `/api/`。
+- Docker：`deploy/docker-compose.yml` 包含 API 和 Web 两个容器，均运行在宿主机网络上；API 按 `.env` 中的配置经 `127.0.0.1` 直连服务器 MySQL（无需改 bind-address 和防火墙），Web(Nginx) 托管前端并反代 `/api/`。
 - 不依赖 Redis 和 SMTP：限流在 API 进程内存中实现，登录无需邮箱验证码。
 
 ## 快速部署
