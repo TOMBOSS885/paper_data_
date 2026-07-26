@@ -610,7 +610,12 @@ func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
 	attach(0, roots, 1)
 	items := make([]map[string]any, 0, len(roots))
 	for _, n := range roots {
-		items = append(items, map[string]any{"id": n.ID, "parentId": n.ParentID, "name": n.Name, "sortOrder": n.SortOrder, "paperCount": n.PaperCount, "children": n.Children})
+		// 后端把 nil 切片序列化为 null，前端需要空数组而不是 null 才能安全地 map/length。
+		children := n.Children
+		if children == nil {
+			children = []*node{}
+		}
+		items = append(items, map[string]any{"id": n.ID, "parentId": n.ParentID, "name": n.Name, "sortOrder": n.SortOrder, "paperCount": n.PaperCount, "children": children})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

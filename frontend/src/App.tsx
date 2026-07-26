@@ -588,8 +588,10 @@ function PaperDetailPage() {
 
   const flatCategories = useMemo(() => {
     const out: { id: number; name: string }[] = []
-    const walk = (list: Category[], prefix = '') => {
+    const walk = (list: Category[] | null | undefined, prefix = '') => {
+      if (!list) return
       list.forEach((c) => {
+        if (!c || c.id == null) return
         out.push({ id: c.id, name: prefix ? `${prefix} / ${c.name}` : c.name })
         walk(c.children, prefix ? `${prefix} / ${c.name}` : c.name)
       })
