@@ -1,82 +1,24 @@
 # Personal Paper Knowledge Base
 
-React + Go + MySQL + Redis 的单管理员论文知识库。完整设计规范位于 [`doc/README.md`](doc/README.md)。
+React + Go + MySQL 的单管理员论文知识库。部署步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md)，原始设计规范位于 [`doc/README.md`](doc/README.md)（其中 SMTP/Redis 部分已废弃）。
 
 ## 当前实现
 
-- Go API：健康检查、一次性初始化、SMTP 验证码、Cookie 会话、CSRF、论文列表/全文查询、上传、详情、乐观锁更新、预览/下载、软删除、Dashboard。
-- React：`/setup`、登录二次验证、Dashboard、论文库、导入、分类标签基础工作区；使用 HttpOnly Cookie 和自动 CSRF 头。
-- Docker：`deploy/docker-compose.yml` 包含 API、Web、Redis；API 通过 Docker host gateway 连接服务器系统 MySQL，Redis 仅在内部网络，Web 监听宿主机端口。
+- Go API：健康检查、一次性初始化（SETUP_SECRET）、邮箱 + 密码登录、Cookie 会话、CSRF、论文列表/全文查询、上传、详情、乐观锁更新、预览/下载、软删除、Dashboard。
+- React：`/setup`、登录、Dashboard、论文库、导入、分类标签基础工作区；使用 HttpOnly Cookie 和自动 CSRF 头。
+- Docker：`deploy/docker-compose.yml` 包含 API 和 Web 两个容器；API 通过 Docker host gateway 按 `.env` 中的配置直连服务器 MySQL，Web(Nginx) 托管前端并反代 `/api/`。
+- 不依赖 Redis 和 SMTP：限流在 API 进程内存中实现，登录无需邮箱验证码。
 
-## 首次部署
+## 快速部署
 
-1. 复制环境模板：
-
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-
-2. 为系统 MySQL 的 `MYSQL_PASSWORD`、`REDIS_PASSWORD`、`JWT_SECRET`、`SETUP_SECRET` 和 SMTP 配置填写真实值。可用 PowerShell 生成随机密钥：
-
-   ```powershell
-   $bytes = New-Object byte[] 48; [Security.Cryptography.RandomNumberGenerator]::Fill($bytes); [Convert]::ToBase64String($bytes)
-   ```
-
-3. 在安装 Docker Engine/Compose 的机器一键部署：
-
-   ```bash
-   bash deploy.sh
-   ```
-
-   Windows Server/PowerShell：
-
-   ```powershell
-   .\deploy.ps1
-   ```
-
-4. 脚本会校验 `.env`、构建镜像、启动 Redis/API/Web、连接系统 MySQL、执行版本化数据库迁移并等待健康检查。完成后打开 `/setup`，输入 `.env` 中的 `SETUP_SECRET`、管理员邮箱、SMTP 验证码和强密码。
-
-## 准备系统 MySQL
-
-MySQL 必须监听 Docker 网桥可访问的地址。在宝塔或 `/etc/my.cnf` 中将 `bind-address` 设置为服务器内网地址或 `0.0.0.0`，重启 MySQL，然后创建仅允许项目 Docker 子网访问的数据库账号：
-
-```sql
-CREATE DATABASE IF NOT EXISTS paper_kb
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS 'paper_kb_app'@'172.30.0.%'
-  IDENTIFIED BY '与 .env 中 MYSQL_PASSWORD 相同的密码';
-GRANT ALL PRIVILEGES ON paper_kb.* TO 'paper_kb_app'@'172.30.0.%';
-FLUSH PRIVILEGES;
+```bash
+cp .env.example .env
+# 填写 MYSQL_PASSWORD、JWT_SECRET、SETUP_SECRET、PUBLIC_BASE_URL
+bash deploy.sh          # Linux
+# 或 .\deploy.ps1       # Windows Server
 ```
 
-`.env` 对应配置：
-
-```env
-DOCKER_SUBNET=172.30.0.0/24
-MYSQL_HOST=host.docker.internal
-MYSQL_PORT=3306
-MYSQL_DATABASE=paper_kb
-MYSQL_USERNAME=paper_kb_app
-MYSQL_PASSWORD=上面设置的密码
-REDIS_DB=0
-```
-
-不要把 3306 开放到公网。防火墙只允许本机 Docker 子网 `172.30.0.0/24` 访问。若该网段与服务器现有网络冲突，同时修改 `DOCKER_SUBNET` 和 MySQL 用户的来源网段。
-
-5. 生产环境必须使用 HTTPS 反向代理；当前 Compose Web 层提供安全响应头和 HTTP 入口，TLS 可由宿主机 Nginx/Caddy 或云负载均衡终止。
-
-## Docker Hub 拉取超时
-
-项目的所有基础镜像都可以通过 `.env` 覆盖。服务器无法访问 Docker Hub 时，使用云厂商提供的可信镜像加速地址：
-
-```env
-GO_IMAGE=镜像加速域名/library/golang:1.22-alpine
-NODE_IMAGE=镜像加速域名/library/node:22-alpine
-NGINX_IMAGE=镜像加速域名/library/nginx:1.27-alpine
-REDIS_IMAGE=镜像加速域名/library/redis:7.4-alpine
-```
-
-修改后重新运行 `bash deploy.sh`。生产环境应优先使用服务器云厂商提供的专属 Docker Hub 加速地址，并在部署后记录镜像 digest。
+完成后打开 `http://服务器IP/setup`，输入 `.env` 中的 `SETUP_SECRET` 创建管理员。详细说明（MySQL 准备、常见问题、备份）见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
 
 ## 本地开发
 
@@ -84,8 +26,8 @@ REDIS_IMAGE=镜像加速域名/library/redis:7.4-alpine
 
 ```powershell
 cd backend
-$env:GOCACHE="$PWD\..\.gocache"
-$env:GOMODCACHE="$PWD\..\.gomodcache"
+$env:JWT_SECRET='本地开发用的至少32字符随机串________'
+$env:SETUP_SECRET='另一个至少32字符的随机串__________'
 go test ./...
 go run ./cmd/server
 ```
@@ -101,7 +43,7 @@ npm run dev
 ## 当前验证结果
 
 - `backend`: `gofmt`、`go test ./...`、`go vet ./...` 已通过。
-- `frontend`: `npm ci`、`npm run build` 已通过。
-- 当前执行环境未安装 Docker CLI，因此尚未在本机执行 `docker compose up`；部署机器需要 Docker Engine/Compose。
+- `frontend`: `npm run build` 已通过。
+- 本机未安装 Docker CLI，`docker compose up` 需在部署服务器上执行。
 
-安全注意：不要提交 `.env`、上传目录、Docker 凭据或 SMTP 授权码。上线前按 [`doc/05-security.md`](doc/05-security.md) 完成恶意上传、CSRF、IDOR、限流、备份恢复和镜像扫描验收。
+安全注意：不要提交 `.env`、上传目录或数据库凭据。生产环境建议使用 HTTPS 反向代理并将 `COOKIE_SECURE` 设为 `true`。

@@ -17,12 +17,12 @@ fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
   cp "$ROOT_DIR/.env.example" "$ENV_FILE"
-  echo "已创建 .env。请填写系统 MySQL、Redis、JWT_SECRET、SETUP_SECRET 和 SMTP 后重新执行 ./deploy.sh。" >&2
+  echo "已创建 .env。请填写 MYSQL_PASSWORD、JWT_SECRET、SETUP_SECRET 后重新执行 ./deploy.sh。" >&2
   exit 1
 fi
 
-if grep -Eq 'replace_with_|example\.com' "$ENV_FILE"; then
-  echo "错误：.env 仍包含示例值。请先填写全部密钥、域名和 SMTP 配置。" >&2
+if grep -Eq 'replace_with_' "$ENV_FILE"; then
+  echo "错误：.env 仍包含示例值。请先填写 MYSQL_PASSWORD、JWT_SECRET 和 SETUP_SECRET。" >&2
   exit 1
 fi
 
@@ -35,12 +35,12 @@ echo "等待服务启动……"
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:${HTTP_PORT}/api/health" >/dev/null 2>&1; then
     echo "部署完成：http://服务器地址:${HTTP_PORT}/setup"
-    echo "生产环境请通过 HTTPS 域名访问，并在首次初始化时输入 .env 中的 SETUP_SECRET。"
+    echo "首次初始化时输入 .env 中的 SETUP_SECRET 创建管理员账号。"
     exit 0
   fi
   sleep 3
 done
 
 echo "服务未在预期时间内就绪，显示最近日志：" >&2
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --tail=100 api web redis >&2
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --tail=100 api web >&2
 exit 1

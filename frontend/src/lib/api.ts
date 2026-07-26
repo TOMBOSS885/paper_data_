@@ -18,7 +18,6 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const setupStatus = () => api<{ data: { initialized: boolean } }>('/setup/status')
-export const sendCode = (email: string, purpose: string) => api('/auth/send-code', { method: 'POST', body: JSON.stringify({ email, purpose }) })
 export const createAdmin = (payload: Record<string, string>) => api('/setup/admin', { method: 'POST', body: JSON.stringify(payload) })
 export const login = (payload: Record<string, string>) => api('/auth/login', { method: 'POST', body: JSON.stringify(payload) })
 export const me = () => api<{ data: { displayName: string; email: string } }>('/auth/me')

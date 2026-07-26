@@ -15,23 +15,11 @@ type Config struct {
 	Port              string
 	PublicBaseURL     string
 	MySQLDSN          string
-	RedisAddr         string
-	RedisPassword     string
-	RedisDB           int
-	RedisTLS          bool
 	JWTSecret         string
 	SetupSecret       string
 	CookieSecure      bool
 	CookieSameSite    string
 	AllowedOrigins    map[string]struct{}
-	SMTPHost          string
-	SMTPPort          int
-	SMTPUsername      string
-	SMTPPassword      string
-	SMTPFrom          string
-	SMTPFromName      string
-	SMTPTLSMode       string
-	EmailCodeTTL      time.Duration
 	UploadDir         string
 	UploadMaxBytes    int64
 	UploadQuotaBytes  int64
@@ -48,23 +36,11 @@ func Load() (Config, error) {
 		Host:              getenv("SERVER_HOST", "0.0.0.0"),
 		Port:              getenv("SERVER_PORT", "8080"),
 		PublicBaseURL:     getenv("PUBLIC_BASE_URL", "http://localhost:8080"),
-		RedisAddr:         getenv("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
-		RedisDB:           envInt("REDIS_DB", 0),
-		RedisTLS:          envBool("REDIS_TLS", false),
 		JWTSecret:         os.Getenv("JWT_SECRET"),
 		SetupSecret:       os.Getenv("SETUP_SECRET"),
 		CookieSecure:      envBool("COOKIE_SECURE", false),
 		CookieSameSite:    getenv("COOKIE_SAMESITE", "lax"),
 		AllowedOrigins:    splitSet(os.Getenv("CORS_ALLOWED_ORIGINS")),
-		SMTPHost:          os.Getenv("SMTP_HOST"),
-		SMTPPort:          envInt("SMTP_PORT", 587),
-		SMTPUsername:      os.Getenv("SMTP_USERNAME"),
-		SMTPPassword:      os.Getenv("SMTP_PASSWORD"),
-		SMTPFrom:          os.Getenv("SMTP_FROM"),
-		SMTPFromName:      getenv("SMTP_FROM_NAME", "Paper Knowledge Base"),
-		SMTPTLSMode:       getenv("SMTP_TLS_MODE", "starttls"),
-		EmailCodeTTL:      time.Duration(envInt("EMAIL_CODE_TTL_SECONDS", 600)) * time.Second,
 		UploadDir:         getenv("UPLOAD_DIR", "./uploads"),
 		UploadMaxBytes:    envInt64("UPLOAD_MAX_BYTES", 200*1024*1024),
 		UploadQuotaBytes:  envInt64("UPLOAD_QUOTA_BYTES", 100*1024*1024*1024),
@@ -88,31 +64,17 @@ func (c Config) validate() error {
 	if len(c.SetupSecret) < 32 {
 		return errors.New("SETUP_SECRET must contain at least 32 bytes")
 	}
-	if c.Env == "production" {
-		if len(c.SetupSecret) < 32 || c.SetupSecret == c.JWTSecret {
-			return errors.New("SETUP_SECRET must be a separate random secret in production")
-		}
-		if !c.CookieSecure {
-			return errors.New("COOKIE_SECURE must be true in production")
-		}
-		if len(c.AllowedOrigins) == 0 {
-			return errors.New("CORS_ALLOWED_ORIGINS is required in production")
-		}
-		if c.SMTPHost == "" || c.SMTPFrom == "" {
-			return errors.New("SMTP_HOST and SMTP_FROM are required in production")
-		}
-	}
-	if c.EmailCodeTTL < 5*time.Minute || c.EmailCodeTTL > 15*time.Minute {
-		return errors.New("EMAIL_CODE_TTL_SECONDS must be between 300 and 900")
+	if c.Env == "production" && c.SetupSecret == c.JWTSecret {
+		return errors.New("SETUP_SECRET must be a separate random secret in production")
 	}
 	if c.SearchMaxPageSize < 1 || c.SearchMaxPageSize > 100 {
 		return errors.New("SEARCH_MAX_PAGE_SIZE must be between 1 and 100")
 	}
-	if c.RedisDB < 0 || c.RedisDB > 15 {
-		return errors.New("REDIS_DB must be between 0 and 15")
+	if c.LoginMaxFails < 1 {
+		return errors.New("LOGIN_LIMIT_MAX_FAILS must be at least 1")
 	}
-	if c.SMTPTLSMode != "starttls" && c.SMTPTLSMode != "tls" {
-		return errors.New("SMTP_TLS_MODE must be starttls or tls")
+	if c.SessionTTL < time.Minute {
+		return errors.New("SESSION_TTL_SECONDS must be at least 60")
 	}
 	return nil
 }
