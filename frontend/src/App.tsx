@@ -284,21 +284,36 @@ function Dashboard() {
 function PaperRow({ paper }: { paper: Paper }) {
   const tags = paper.tags ?? []
   const cats = paper.categories ?? []
+  const nav = useNavigate()
+  // 整行跳详情页，但分类/标签 chip 是独立的筛选链接：用按钮 + stopPropagation
+  // 避免嵌套 <a> / <button> 造成浏览器丢弃事件。
+  const goDetail = () => nav(`/app/papers/${paper.id}`)
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      goDetail()
+    }
+  }
+  const stop = (e: React.MouseEvent) => e.stopPropagation()
   return (
-    <Link className="paper-row" to={`/app/papers/${paper.id}`}>
+    <div className="paper-row" role="link" tabIndex={0} onClick={goDetail} onKeyDown={onKey}>
       <div className="paper-icon"><BookOpen size={18} /></div>
       <div className="paper-main">
         <strong>{paper.isFavorite ? '★ ' : ''}{paper.title}</strong>
         <span>{authorLine(paper)}{paper.journal ? ` · ${paper.journal}` : ''}</span>
         {(tags.length > 0 || cats.length > 0) && (
           <span className="row-taxonomy">
-            {cats.map((c) => <span className="taxonomy-chip cat" key={`c-${c.id}`}>{c.name}</span>)}
-            {tags.map((t) => <span className={`taxonomy-chip tag tag-${t.color}`} key={`t-${t.id}`}>#{t.name}</span>)}
+            {cats.map((c) => (
+              <button type="button" className="taxonomy-chip cat" key={`c-${c.id}`} onClick={(e) => { stop(e); nav(`/app/papers?category=${c.id}`) }}>{c.name}</button>
+            ))}
+            {tags.map((t) => (
+              <button type="button" className={`taxonomy-chip tag tag-${t.color}`} key={`t-${t.id}`} onClick={(e) => { stop(e); nav(`/app/papers?tag=${t.id}`) }}>#{t.name}</button>
+            ))}
           </span>
         )}
       </div>
       <span className="row-status">{statusLabel(paper.readingStatus)}</span>
-    </Link>
+    </div>
   )
 }
 
@@ -806,18 +821,27 @@ function Taxonomy() {
   const [expanded, setExpanded] = useState<Record<number, boolean>>({})
 
   const reload = useCallback(async () => {
-    try {
-      const [t, c] = await Promise.all([listTags().then((r) => r.data.items), listCategories().then((r) => r.data.items)])
-      setTags(t)
-      setCategories(c)
-    } catch (e) {
-      setError(errorMessage(e))
-    }
+    // reload 自身不能抛出——任何一项失败都必须降级为空数组，避免污染提交流的 try/catch。
+    const [tagsResult, catsResult] = await Promise.allSettled([
+      listTags().then((r) => r.data.items),
+      listCategories().then((r) => r.data.items),
+    ])
+    if (tagsResult.status === 'fulfilled') setTags(tagsResult.value)
+    if (catsResult.status === 'fulfilled') setCategories(catsResult.value)
+    const reason = tagsResult.status === 'rejected' ? tagsResult.reason : catsResult.status === 'rejected' ? catsResult.reason : null
+    return reason as unknown
   }, [])
 
   useEffect(() => {
     void reload()
   }, [reload])
+
+  // 成功提示 3 秒后自动消失，避免堆叠；切换 Tab 时也会被清空。
+  useEffect(() => {
+    if (!notice) return
+    const t = setTimeout(() => setNotice(''), 3000)
+    return () => clearTimeout(t)
+  }, [notice])
 
   const submitTag = async () => {
     if (!newTag.name.trim()) return setError('请输入标签名')
@@ -827,7 +851,13 @@ function Taxonomy() {
     try {
       await createTag(newTag.name.trim(), newTag.color)
       setNewTag({ name: '', color: 'teal' })
-      await reload()
+      // 列表刷新失败也不能影响本次创建的成功提示；reload 内部已经用 allSettled 隔离。
+      const refreshErr = await reload()
+      if (refreshErr) {
+        // 仅作为参考提示，不覆盖创建成功的状态条
+        // eslint-disable-next-line no-console
+        console.warn('刷新标签列表失败', refreshErr)
+      }
       setNotice(`已创建标签：${newTag.name.trim()}`)
     } catch (e) {
       setError(errorMessage(e))
@@ -848,7 +878,11 @@ function Taxonomy() {
         sortOrder: 0,
       })
       setNewCat({ name: '', parentId: '' })
-      await reload()
+      const refreshErr = await reload()
+      if (refreshErr) {
+        // eslint-disable-next-line no-console
+        console.warn('刷新分类列表失败', refreshErr)
+      }
       setNotice(`已创建分类：${newCat.name.trim()}`)
     } catch (e) {
       setError(errorMessage(e))
@@ -859,11 +893,15 @@ function Taxonomy() {
 
   const renderCategoryNode = (c: Category, depth = 0): ReactNode => {
     const isOpen = expanded[c.id] ?? true
-    const remove = async () => {
+    const remove = async (e: React.MouseEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
       if (!window.confirm(`删除分类「${c.name}」？会同时移除其子分类与已关联论文的绑定。`)) return
       try {
         await deleteCategory(c.id)
-        await reload()
+        const refreshErr = await reload()
+        if (refreshErr) console.warn('刷新失败', refreshErr)
+        setError('')
         setNotice(`已删除分类：${c.name}`)
       } catch (e) {
         setError(errorMessage(e))
@@ -872,12 +910,12 @@ function Taxonomy() {
     return (
       <div key={c.id} className="cat-node" style={{ paddingLeft: depth * 14 }}>
         <div className="cat-row">
-          <button className="icon-button" aria-label={isOpen ? '收起' : '展开'} onClick={() => setExpanded((m) => ({ ...m, [c.id]: !(m[c.id] ?? true) }))}>
+          <button className="icon-button" type="button" aria-label={isOpen ? '收起' : '展开'} onClick={(e) => { e.stopPropagation(); setExpanded((m) => ({ ...m, [c.id]: !(m[c.id] ?? true) })) }}>
             {c.children.length > 0 ? (isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span style={{ width: 14 }} />}
           </button>
           <Link to={`/app/papers?category=${c.id}`}>{c.name}</Link>
           <small>{c.paperCount} 篇</small>
-          <button className="icon-button danger" aria-label="删除分类" onClick={remove}><Trash2 size={14} /></button>
+          <button className="icon-button danger" type="button" aria-label={`删除分类 ${c.name}`} onClick={remove}><Trash2 size={14} /></button>
         </div>
         {isOpen && c.children.map((sc) => renderCategoryNode(sc, depth + 1))}
       </div>
@@ -896,8 +934,8 @@ function Taxonomy() {
       {error && <div className="alert error">{error}</div>}
       {notice && <div className="alert ok">{notice}</div>}
       <div className="tab-bar">
-        <button className={tab === 'categories' ? 'tab active' : 'tab'} onClick={() => setTab('categories')}>分类树</button>
-        <button className={tab === 'tags' ? 'tab active' : 'tab'} onClick={() => setTab('tags')}>标签</button>
+        <button className={tab === 'categories' ? 'tab active' : 'tab'} onClick={() => { setTab('categories'); setError(''); setNotice('') }}>分类树</button>
+        <button className={tab === 'tags' ? 'tab active' : 'tab'} onClick={() => { setTab('tags'); setError(''); setNotice('') }}>标签</button>
       </div>
       {tab === 'categories' && (
         <div className="taxonomy-grid single">
@@ -943,14 +981,18 @@ function Taxonomy() {
                   <span className={`tag tag-${t.color}`} key={t.id}>
                     <Link to={`/app/papers?tag=${t.id}`}>#{t.name} <small>{t.usageCount ?? 0}</small></Link>
                     <button
+                      type="button"
                       className="tag-remove"
-                      aria-label="删除标签"
+                      aria-label={`删除标签 ${t.name}`}
                       onClick={async (e) => {
                         e.preventDefault()
+                        e.stopPropagation()
                         if (!window.confirm(`删除标签「${t.name}」？所有论文的该标签关联都会被移除。`)) return
                         try {
                           await deleteTag(t.id)
-                          await reload()
+                          const refreshErr = await reload()
+                          if (refreshErr) console.warn('刷新失败', refreshErr)
+                          setError('')
                           setNotice(`已删除标签：${t.name}`)
                         } catch (err) {
                           setError(errorMessage(err))

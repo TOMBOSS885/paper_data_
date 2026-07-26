@@ -10,7 +10,7 @@
 
 两个容器都运行在**宿主机网络**（`network_mode: host`）上，因此连接本机 MySQL 走 `127.0.0.1` 回环——**不需要修改 MySQL 的 bind-address，也不需要调整防火墙**。
 
-```
+```text
 浏览器 ──> web 容器 (Nginx, 监听 0.0.0.0:HTTP_PORT)
               ├── 静态前端 (React)
               └── /api/ 反向代理 ──> api 容器 (Go, 仅监听 127.0.0.1:API_PORT)
@@ -159,6 +159,7 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
 ```
 
 **页面上按钮点了没反应时，最快的定位方式是浏览器端**：按 `F12` 打开开发者工具 →
+
 - **Console** 标签：有红色报错说明是前端 JS 问题；
 - **Network** 标签：点一次按钮，看有没有发出 `/api/...` 请求。
   - 没有请求 → 该控件没绑定行为或路由不存在；
@@ -170,33 +171,44 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
 ## 七、常见问题
 
 **api 容器反复重启，日志显示 `connect mysql: ...`**
+
 - `connection refused` → 本机 MySQL 没在运行或端口不是 3306（`ss -tlnp | grep 3306` 检查）；
 - `Access denied` → 账号/密码不对，确认存在 `'paper_kb_app'@'localhost'`（或 `'127.0.0.1'`/`'%'`）且密码与 `.env` 一致；
 - `Unknown database` → 数据库还没建，按第二节执行建库 SQL。
 
 **能打开页面但登录后立刻退回登录页**
+
 - 用 `http://IP` 访问时 `.env` 中 `COOKIE_SECURE` 必须为 `false`（改完后 `bash deploy.sh` 重新部署）。
 
 **日志显示 `JWT_SECRET must contain at least 32 bytes`**
+
 - `.env` 中密钥太短或未填写，按第三节生成后重新部署。
 
 **镜像拉取超时**
+
 - 在 `.env` 中把 `GO_IMAGE`/`NODE_IMAGE`/`NGINX_IMAGE` 换成云厂商镜像加速地址后重跑脚本。
 
 **构建时 `npm ci` 或 `go mod download` 失败（`Exit handler never called` / 超时）**
+
 - 服务器访问国外源慢导致依赖拉取中断。在 `.env` 中加入（或确认存在）：
+
   ```env
   NPM_REGISTRY=https://registry.npmmirror.com
   GOPROXY_URL=https://goproxy.cn,direct
   ```
+
   然后重跑 `bash deploy.sh`。
+
 - 若仍失败,检查内存：`free -h`。1GB 及以下的服务器请先加 swap：
+
   ```bash
   fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
   ```
 
 **构建报 `dial tcp: lookup xxx on ...:53: i/o timeout`（容器内 DNS 解析失败）**
+
 - compose 已对两个镜像的构建配置了 `network: host`（构建时直接用宿主机网络和 DNS），正常情况下不会再遇到此问题。若使用自定义 buildx builder 导致 `network: host` 被拒绝，改用默认 builder（`docker buildx use default`）或按下面方式给 Docker 守护进程指定 DNS：
+
   ```bash
   # 若 /etc/docker/daemon.json 已有内容，在原 JSON 中增加 "dns" 字段即可
   tee /etc/docker/daemon.json <<'EOF'
@@ -207,12 +219,15 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
   systemctl restart docker
   docker run --rm alpine nslookup goproxy.cn   # 验证能解析后重跑 deploy.sh
   ```
+
 - 仍不通则检查防火墙是否拦截了 Docker 网桥的出站 UDP 53（`ufw status`；必要时 `ufw allow out 53/udp`，或将 `/etc/default/ufw` 的 `DEFAULT_FORWARD_POLICY` 改为 `ACCEPT` 后 `ufw reload`）。
 
 **80 或 8080 端口被占用（容器起不来 / `bind: address already in use`）**
+
 - 容器用宿主机网络，`HTTP_PORT` 和 `API_PORT` 都实际占用宿主机端口。修改 `.env` 中对应端口后重跑脚本。
 
 **部署成功但外网打不开页面**
+
 - 宿主机防火墙（ufw/宝塔安全页）没放行 `HTTP_PORT`。推荐做法：不开端口，直接在宝塔给域名建站点开 HTTPS，反向代理到 `http://127.0.0.1:HTTP_PORT`（回环流量不受防火墙限制）；或临时 `ufw allow HTTP_PORT/tcp` 用 IP 直连测试。
 
 ## 八、标签与分类
@@ -222,6 +237,7 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
 - 在论文详情页可以多选打标（标签 + 分类），刷新后立即生效并刷新列表中的小色块。
 - 删除分类会级联清理子分类和已绑定的论文关联；删除标签会移除所有论文的该标签绑定。
 - 论文库筛选支持 `tag=<id>` 与 `category=<id>`，可与关键词、年份、状态、收藏叠加使用。
+- 创建/删除后会在当前 Tab 顶部展示 3 秒的成功提示；如果列表刷新失败，控制台会打印 `刷新失败`，**不会用红条覆盖创建成功的状态**，可在切回时再次手动刷新（`F5` 或重新进入页面）。
 
 ## 九、安全建议
 
