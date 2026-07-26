@@ -1,6 +1,6 @@
 module paper-knowledge-base/backend
 
-go 1.25.0
+go 1.22.0
 
 require (
 	github.com/go-sql-driver/mysql v1.9.3
