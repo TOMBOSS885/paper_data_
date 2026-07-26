@@ -34,6 +34,8 @@ import {
   uploadPapers,
 } from './lib/api'
 import type { Category, Paper, PaperDetail, Tag, UploadResult } from './lib/api'
+import { extractPapersPreview } from './lib/api'
+import { CitationSettingsPage, CitationModal } from './components/Citation'
 
 // 标签颜色映射：与 styles.css 中 .tag.<color> 的类名一致。
 const TAG_COLORS: { value: TagColor; label: string }[] = [
@@ -92,7 +94,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundary
   }
 }
 
-function Shell({ children }: { children: ReactNode }) {
+export function Shell({ children }: { children: ReactNode }) {
   const nav = useNavigate()
   const loc = useLocation()
   const [open, setOpen] = useState(false)
@@ -103,6 +105,7 @@ function Shell({ children }: { children: ReactNode }) {
     { to: '/app/import', label: '导入论文', icon: Upload },
     { to: '/app/taxonomy', label: '分类与标签', icon: Tags },
     { to: '/app/settings/security', label: '安全设置', icon: Settings2 },
+    { to: '/app/settings/citations', label: '引用格式', icon: BookOpen },
   ]
 
   // ⌘K / Ctrl+K 聚焦全局搜索框。
@@ -861,6 +864,15 @@ function PaperDetailPage() {
   const { data: allCategories } = useCategories()
   const [selectedTagIDs, setSelectedTagIDs] = useState<number[]>([])
   const [selectedCategoryIDs, setSelectedCategoryIDs] = useState<number[]>([])
+  const [citationModalOpen, setCitationModalOpen] = useState(false)
+
+  useEffect(() => {
+    const handleOpen = (e: any) => {
+      if (e.detail === id) setCitationModalOpen(true)
+    }
+    document.addEventListener('open-citation', handleOpen)
+    return () => document.removeEventListener('open-citation', handleOpen)
+  }, [id])
 
   const apply = (detail: PaperDetail) => {
     setData(detail)
@@ -1001,6 +1013,30 @@ function PaperDetailPage() {
             <button className="button primary" disabled={busy} onClick={() => patch({ title: form.title.trim() || data.title, doi: form.doi.trim(), abstract: form.abstract, readingStatus: form.readingStatus }, '已保存')}>
               <Save size={16} />{busy ? '保存中…' : '保存修改'}
             </button>
+            <button className="button secondary" disabled={busy} onClick={async () => {
+              if (busy) return;
+              setBusy(true); setError(''); setNotice('');
+              try {
+                const res = await import('./lib/api').then(m => m.reextractPaper(id));
+                setNotice('重新识别完成');
+                if (res) {
+                  const toUpdate: Partial<PaperDetail> = {}
+                  if (res.Title) toUpdate.title = res.Title
+                  if (res.Year) toUpdate.year = res.Year
+                  if (res.Subject) toUpdate.journal = res.Subject
+                  if (res.Authors && res.Authors.length) toUpdate.authors = res.Authors.map(name => ({ name }))
+                  if (Object.keys(toUpdate).length > 0) apply({ ...data, ...toUpdate })
+                }
+              } catch(e) {
+                setError(errorMessage(e));
+              } finally {
+                setBusy(false);
+              }
+            }}><BookOpen size={16} />重新识别</button>
+            <button className="button secondary" onClick={() => import('react').then(() => {
+               // Use a custom event or just local state to open citation modal
+               document.dispatchEvent(new CustomEvent('open-citation', { detail: id }))
+            })}><BookOpen size={16} />引用</button>
             <button className="button secondary" disabled={busy} onClick={() => setDeleteOpen(true)}><Trash2 size={16} />删除论文</button>
           </div>
           <div className="taxonomy-editor">
@@ -1060,6 +1096,7 @@ function PaperDetailPage() {
         onConfirm={destroyWithPassword}
         onCancel={() => setDeleteOpen(false)}
       />
+      {citationModalOpen && <CitationModal paperId={id} onClose={() => setCitationModalOpen(false)} />}
     </Shell>
   )
 }
@@ -1067,9 +1104,11 @@ function PaperDetailPage() {
 function Import() {
   const [files, setFiles] = useState<File[]>([])
   const [results, setResults] = useState<UploadResult[]>([])
+  const [previewResults, setPreviewResults] = useState<{fileName: string, meta: {Title?: string, Authors?: string[], Year?: number, Subject?: string}}[]>([])
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const pick = (list: FileList | null) => {
@@ -1088,6 +1127,21 @@ function Import() {
       return
     }
     setFiles(chosen)
+    setPreviewResults([])
+  }
+
+  const preview = async () => {
+    if (!files.length) return
+    setPreviewing(true)
+    setError('')
+    try {
+      const r = await extractPapersPreview(files)
+      setPreviewResults(r)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setPreviewing(false)
+    }
   }
 
   const submit = async () => {
@@ -1135,11 +1189,30 @@ function Import() {
           </div>
         )}
         <div className="import-actions">
-          <button className="button primary" disabled={!files.length || busy} onClick={submit}><Upload size={17} />{busy ? '正在上传…' : '开始导入'}</button>
-          {files.length > 0 && !busy && <button className="button secondary" onClick={() => { setFiles([]); if (inputRef.current) inputRef.current.value = '' }}>清空</button>}
+          <button className="button primary" disabled={!files.length || busy || previewing} onClick={submit}><Upload size={17} />{busy ? '正在上传…' : '开始导入'}</button>
+          {files.length > 0 && !busy && !previewing && <button className="button secondary" onClick={preview}>试识别</button>}
+          {files.length > 0 && !busy && !previewing && <button className="button secondary" onClick={() => { setFiles([]); setPreviewResults([]); if (inputRef.current) inputRef.current.value = '' }}>清空</button>}
           {notice && <span className="success-text">{notice}</span>}
           {results.length > 0 && <Link to="/app/papers">前往论文库 →</Link>}
         </div>
+        {previewResults.length > 0 && (
+          <div className="file-list">
+            <h4>识别预览结果：</h4>
+            {previewResults.map((r, i) => (
+              <div className="file-item" key={i} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+                <div><BookOpen size={17} style={{ verticalAlign: 'middle', marginRight: 8 }}/><strong>{r.fileName}</strong></div>
+                {r.meta && Object.keys(r.meta).length > 0 ? (
+                  <div style={{ fontSize: '13px', color: '#666', paddingLeft: 24 }}>
+                    {r.meta.Title && <div>标题：{r.meta.Title}</div>}
+                    {r.meta.Authors && r.meta.Authors.length > 0 && <div>作者：{r.meta.Authors.join('; ')}</div>}
+                    {r.meta.Year && <div>年份：{r.meta.Year}</div>}
+                    {r.meta.Subject && <div>期刊/主题：{r.meta.Subject}</div>}
+                  </div>
+                ) : <div style={{ fontSize: '13px', color: '#999', paddingLeft: 24 }}>未能识别出元数据</div>}
+              </div>
+            ))}
+          </div>
+        )}
         {results.length > 0 && (
           <div className="file-list">
             {results.map((r) => (
@@ -1468,6 +1541,7 @@ export default function App() {
         <Route path="/app/import" element={guard(<Import />)} />
         <Route path="/app/taxonomy" element={guard(<Taxonomy />)} />
         <Route path="/app/settings/security" element={guard(<Security />)} />
+        <Route path="/app/settings/citations" element={guard(<CitationSettingsPage />)} />
         <Route path="*" element={<Navigate to={fallback} replace />} />
       </Routes>
     </PageErrorBoundary>

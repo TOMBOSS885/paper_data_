@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"paper-knowledge-base/backend/internal/config"
+	"paper-knowledge-base/backend/internal/pdfmeta"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -107,8 +108,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/categories", withCacheHeaders(300, gzipResponse(s.categories)))
 	mux.HandleFunc("/api/tags/", gzipResponse(s.tagByID))
 	mux.HandleFunc("/api/categories/", gzipResponse(s.categoryByID))
+	mux.HandleFunc("/api/papers/extract", s.extractPapers)
 	mux.HandleFunc("/api/papers", s.papers)
 	mux.HandleFunc("/api/papers/", s.paperByID)
+
+	mux.HandleFunc("/api/citation/formats", s.citationFormats)
+	mux.HandleFunc("/api/citation/formats/", s.citationFormatByID)
 	return s.withMiddleware(mux)
 }
 
@@ -1819,6 +1824,15 @@ func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[
 	if ext == ".pdf" && !strings.HasPrefix(string(head), "%PDF-") {
 		return nil, fmt.Errorf("file signature mismatch")
 	}
+	var meta pdfmeta.Extracted
+	if ext == ".pdf" && strings.HasPrefix(string(head), "%PDF-") {
+		f.Seek(0, 0)
+		if raw, err := io.ReadAll(f); err == nil {
+			meta = pdfmeta.Extract(raw)
+		}
+	}
+	f.Seek(0, 0)
+	
 	if err := os.MkdirAll(s.cfg.UploadDir, 0700); err != nil {
 		return nil, err
 	}
@@ -1838,8 +1852,22 @@ func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[
 		return nil, err
 	}
 	title := strings.TrimSuffix(filepath.Base(fh.Filename), ext)
+	if meta.Title != "" {
+		title = meta.Title
+	}
+	authorsJSON := "[]"
+	if len(meta.Authors) > 0 {
+		if b, err := json.Marshal(meta.Authors); err == nil {
+			authorsJSON = string(b)
+		}
+	}
+	var publishedAt *string
+	if meta.Year > 0 {
+		d := fmt.Sprintf("%04d-01-01", meta.Year)
+		publishedAt = &d
+	}
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO papers(id,title,abstract_text,authors_json,journal,reading_status,parse_status,source_type,added_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, title, "", "[]", "", "unread", "queued", "upload", now, now)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO papers(id,title,abstract_text,authors_json,journal,published_at,reading_status,parse_status,source_type,added_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, title, "", authorsJSON, meta.Subject, publishedAt, "unread", "queued", "upload", now, now)
 	if err != nil {
 		_ = os.Remove(path)
 		return nil, err
@@ -1894,6 +1922,22 @@ func (s *Server) paperByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.updatePaperTaxonomy(w, r, parts[0], parts[1])
+			return
+		}
+		if parts[1] == "reextract" {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			s.reextractPaper(w, r, parts[0])
+			return
+		}
+		if parts[1] == "cite" {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			s.citePaper(w, r, parts[0])
 			return
 		}
 		writeError(w, 404, "not_found", "paper not found")

@@ -167,5 +167,19 @@ export const TAG_COLORS: { value: string; label: string }[] = [
   { value: 'rose', label: '玫瑰' },
   { value: 'slate', label: '中性灰' },
   { value: 'green', label: '草绿' },
-  { value: 'violet', label: '紫罗兰' },
+	{ value: 'violet', label: '紫罗兰' },
 ]
+
+export type CitationFormat = { id: string | number; name: string; builtin: boolean; template: string }
+export const citationFormats = () => api<{ items: CitationFormat[] }>('/citation/formats')
+export const createCitationFormat = (payload: { name: string; template: string }) => api<CitationFormat>('/citation/formats', { method: 'POST', body: JSON.stringify(payload) })
+export const updateCitationFormat = (id: string | number, payload: { name?: string; template?: string }) => api(`/citation/formats/${id}`, { method: 'PATCH', body: JSON.stringify(payload) })
+export const deleteCitationFormat = (id: string | number) => api(`/citation/formats/${id}`, { method: 'DELETE' })
+
+export const citePaper = (id: string, format: string) => api<{ citation: string }>(`/papers/${encodeURIComponent(id)}/cite?format=${encodeURIComponent(format)}`)
+export const reextractPaper = (id: string) => api<{ status?: string, Title?: string, Authors?: string[], Year?: number, Subject?: string }>(`/papers/${encodeURIComponent(id)}/reextract`, { method: 'POST' })
+export const extractPapersPreview = (files: File[]) => {
+  const form = new FormData()
+  files.forEach((file) => form.append('files', file))
+  return api<{ fileName: string, meta: { Title?: string, Authors?: string[], Year?: number, Subject?: string } }[]>('/papers/extract', { method: 'POST', body: form })
+}
