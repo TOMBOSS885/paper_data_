@@ -5,6 +5,8 @@ services:
     build:
       context: ../backend
       dockerfile: Dockerfile
+      # 构建时使用宿主机网络,规避容器内 DNS 不可用的问题
+      network: host
       args:
         GO_IMAGE: "${GO_IMAGE:-golang:1.22-alpine}"
         GOPROXY_URL: "${GOPROXY_URL:-https://proxy.golang.org,direct}"
@@ -31,6 +33,7 @@ services:
     build:
       context: ..
       dockerfile: frontend/Dockerfile
+      network: host
       args:
         NODE_IMAGE: "${NODE_IMAGE:-node:22-alpine}"
         NGINX_IMAGE: "${NGINX_IMAGE:-nginx:1.27-alpine}"

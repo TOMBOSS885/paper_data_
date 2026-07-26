@@ -148,6 +148,20 @@ docker run --rm -v paper-knowledge-base_paper_uploads:/data -v $(pwd):/backup al
   fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
   ```
 
+**构建报 `dial tcp: lookup xxx on ...:53: i/o timeout`（容器内 DNS 解析失败）**
+- compose 已对两个镜像的构建配置了 `network: host`（构建时直接用宿主机网络和 DNS），正常情况下不会再遇到此问题。若使用自定义 buildx builder 导致 `network: host` 被拒绝，改用默认 builder（`docker buildx use default`）或按下面方式给 Docker 守护进程指定 DNS：
+  ```bash
+  # 若 /etc/docker/daemon.json 已有内容，在原 JSON 中增加 "dns" 字段即可
+  tee /etc/docker/daemon.json <<'EOF'
+  {
+    "dns": ["223.5.5.5", "119.29.29.29", "8.8.8.8"]
+  }
+  EOF
+  systemctl restart docker
+  docker run --rm alpine nslookup goproxy.cn   # 验证能解析后重跑 deploy.sh
+  ```
+- 仍不通则检查防火墙是否拦截了 Docker 网桥的出站 UDP 53（`ufw status`；必要时 `ufw allow out 53/udp`，或将 `/etc/default/ufw` 的 `DEFAULT_FORWARD_POLICY` 改为 `ACCEPT` 后 `ufw reload`）。
+
 **80 端口被占用**
 - 修改 `.env` 中 `HTTP_PORT`（如 8081）后重跑脚本，访问 `http://IP:8081`。
 
