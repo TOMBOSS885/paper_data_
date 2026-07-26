@@ -19,7 +19,9 @@ import {
   deleteTag,
   fileUrl,
   listCategories,
+  useCategories,
   listTags,
+  useTags,
   login,
   logout,
   me,
@@ -511,8 +513,8 @@ function Papers() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [draft, setDraft] = useState(q)
-  const [allTags, setAllTags] = useState<Tag[]>([])
-  const [allCategories, setAllCategories] = useState<Category[]>([])
+  const { data: allTags } = useTags()
+  const { data: allCategories } = useCategories()
   // 批量选择：跨页会被自动清空，避免误操作。点击"全选本页"一键勾选当前 20 篇。
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   // 批量操作需要的 modal 状态机：null=无；先打开 taxonomy 选择 modal，再打开 password modal。
@@ -597,14 +599,7 @@ function Papers() {
     return `?${search.toString()}`
   }, [q, status, favorite, yearFrom, yearTo, tagFilter, categoryFilter, sort, page])
 
-  // 加载一次标签与分类，供筛选器使用。
-  useEffect(() => {
-    Promise.all([listTags().then((r) => r.data.items).catch(() => [] as Tag[]), listCategories().then((r) => r.data.items).catch(() => [] as Category[])])
-      .then(([tags, cats]) => {
-        setAllTags(tags)
-        setAllCategories(cats)
-      })
-  }, [])
+  // Categories and tags are now managed by React Query
 
   useEffect(() => {
     let alive = true
@@ -862,8 +857,8 @@ function PaperDetailPage() {
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
-  const [allTags, setAllTags] = useState<Tag[]>([])
-  const [allCategories, setAllCategories] = useState<Category[]>([])
+  const { data: allTags } = useTags()
+  const { data: allCategories } = useCategories()
   const [selectedTagIDs, setSelectedTagIDs] = useState<number[]>([])
   const [selectedCategoryIDs, setSelectedCategoryIDs] = useState<number[]>([])
 
@@ -879,14 +874,10 @@ function PaperDetailPage() {
     setLoading(true)
     Promise.all([
       fetchPaper(id),
-      listTags().then((r) => r.data.items).catch(() => [] as Tag[]),
-      listCategories().then((r) => r.data.items).catch(() => [] as Category[]),
     ])
-      .then(([paper, tags, cats]) => {
+      .then(([paper]) => {
         if (!alive) return
         apply(paper.data)
-        setAllTags(tags)
-        setAllCategories(cats)
       })
       .catch((e) => alive && setError(errorMessage(e)))
       .finally(() => alive && setLoading(false))
@@ -1167,8 +1158,8 @@ function Import() {
 
 function Taxonomy() {
   const [tab, setTab] = useState<'tags' | 'categories'>('categories')
-  const [tags, setTags] = useState<Tag[]>([])
-  const [categories, setCategories] = useState<Category[]>([])
+  const { data: tags = [], refetch: refetchTags } = useTags()
+  const { data: categories = [], refetch: refetchCategories } = useCategories()
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [newTag, setNewTag] = useState({ name: '', color: 'teal' })
@@ -1177,20 +1168,9 @@ function Taxonomy() {
   const [expanded, setExpanded] = useState<Record<number, boolean>>({})
 
   const reload = useCallback(async () => {
-    // reload 自身不能抛出——任何一项失败都必须降级为空数组，避免污染提交流的 try/catch。
-    const [tagsResult, catsResult] = await Promise.allSettled([
-      listTags().then((r) => r.data.items),
-      listCategories().then((r) => r.data.items),
-    ])
-    if (tagsResult.status === 'fulfilled') setTags(tagsResult.value)
-    if (catsResult.status === 'fulfilled') setCategories(catsResult.value)
-    const reason = tagsResult.status === 'rejected' ? tagsResult.reason : catsResult.status === 'rejected' ? catsResult.reason : null
-    return reason as unknown
-  }, [])
-
-  useEffect(() => {
-    void reload()
-  }, [reload])
+    const [t, c] = await Promise.all([refetchTags(), refetchCategories()])
+    return t.error || c.error
+  }, [refetchTags, refetchCategories])
 
   // 成功提示 3 秒后自动消失，避免堆叠；切换 Tab 时也会被清空。
   useEffect(() => {

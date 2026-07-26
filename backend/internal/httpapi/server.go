@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 )
 
 type Server struct {
@@ -36,16 +37,15 @@ type Server struct {
 	limiter *limiter
 }
 
-// limiter：每个 key 独立的 bucket（自己的 mutex）+ 全局 RWMutex 只在增删 bucket 时用，
-// 避免旧实现里"每次 allow 都要遍历全部 key"在 1w+ key 下变成全表扫描导致的 CPU 飙升。
-// 后台 GC goroutine 每 5 分钟扫一次过期 bucket，**不在请求路径上做**。
+// limiter：每个 key 独立的 token bucket
+// 后台 GC goroutine 每 5 分钟扫一次长期未访问的 bucket，避免内存泄漏。
 type bucket struct {
-	mu       sync.Mutex
-	attempts []time.Time
+	lim      *rate.Limiter
+	lastSeen time.Time
 }
 
 type limiter struct {
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	buckets map[string]*bucket
 }
 
@@ -55,25 +55,14 @@ func newLimiter() *limiter {
 	return l
 }
 
-// gcLoop 每 5 分钟清理一次已经全部过期的 bucket。所有判断都在持锁下完成。
-// 关键：不在请求路径上做扫描，allow() 只摸自己的 bucket，O(1) 操作。
 func (l *limiter) gcLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		l.mu.Lock()
+		now := time.Now()
 		for k, b := range l.buckets {
-			b.mu.Lock()
-			allExpired := true
-			for _, t := range b.attempts {
-				// 任何 bucket 都按 30 分钟上限判断过期，远超过业务最长 1h 窗口。
-				if time.Since(t) < 30*time.Minute {
-					allExpired = false
-					break
-				}
-			}
-			b.mu.Unlock()
-			if allExpired {
+			if now.Sub(b.lastSeen) > 30*time.Minute {
 				delete(l.buckets, k)
 			}
 		}
@@ -81,41 +70,19 @@ func (l *limiter) gcLoop() {
 	}
 }
 
-func (l *limiter) getOrCreate(key string) *bucket {
-	l.mu.RLock()
-	b, ok := l.buckets[key]
-	l.mu.RUnlock()
-	if ok {
-		return b
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// 双重检查：并发场景下可能已被另一个 goroutine 创建。
-	if b, ok = l.buckets[key]; ok {
-		return b
-	}
-	b = &bucket{}
-	l.buckets[key] = b
-	return b
-}
-
 func (l *limiter) allow(key string, max int, window time.Duration) bool {
-	b := l.getOrCreate(key)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := time.Now()
-	kept := b.attempts[:0]
-	for _, t := range b.attempts {
-		if now.Sub(t) < window {
-			kept = append(kept, t)
+	l.mu.Lock()
+	b, ok := l.buckets[key]
+	if !ok {
+		limit := rate.Every(window / time.Duration(max))
+		b = &bucket{
+			lim: rate.NewLimiter(limit, max),
 		}
+		l.buckets[key] = b
 	}
-	if len(kept) >= max {
-		b.attempts = kept
-		return false
-	}
-	b.attempts = append(kept, now)
-	return true
+	b.lastSeen = time.Now()
+	l.mu.Unlock()
+	return b.lim.Allow()
 }
 
 func New(cfg config.Config, db *sql.DB) *Server {
@@ -1560,7 +1527,7 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 			return r
 		}, rawKw)
 		safe = strings.TrimSpace(safe)
-		
+
 		var kwWhere []string
 		// 先尝试 FULLTEXT：title/abstract 上有 ngram 索引的情况下能走索引，避免全表扫
 		if safe != "" {
@@ -1571,9 +1538,9 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 		like := "%" + escapeLike(rawKw) + "%"
 		kwWhere = append(kwWhere, "(COALESCE(doi,'') LIKE ? OR journal LIKE ? OR authors_json LIKE ?)")
 		args = append(args, like, like, like)
-		
+
 		// 必须将全文索引和 LIKE 用 OR 连接起来，否则就变成了求交集
-		where = append(where, "(" + strings.Join(kwWhere, " OR ") + ")")
+		where = append(where, "("+strings.Join(kwWhere, " OR ")+")")
 	}
 	if st := query.Get("status"); st == "unread" || st == "reading" || st == "read" {
 		where = append(where, "reading_status=?")
@@ -1795,18 +1762,36 @@ func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request", "files is required")
 		return
 	}
-	// 逐个文件汇报结果，单个文件失败不影响其余文件入库。
-	items := make([]map[string]any, 0, len(files))
+	// 并发处理文件上传，最大并发数 4，避免瞬间 I/O 阻塞。
+	// 预分配数组 + 按下标写入，保证结果顺序与请求文件顺序一致。
+	items := make([]map[string]any, len(files))
+	var mu sync.Mutex
 	accepted := 0
-	for _, fh := range files {
-		item, err := s.saveUpload(r.Context(), fh)
-		if err != nil {
-			items = append(items, map[string]any{"filename": fh.Filename, "status": "rejected", "reason": err.Error()})
-			continue
-		}
-		accepted++
-		items = append(items, item)
+
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+
+	for i, fh := range files {
+		i, fh := i, fh
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			item, err := s.saveUpload(r.Context(), fh)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				items[i] = map[string]any{"filename": fh.Filename, "status": "rejected", "reason": err.Error()}
+			} else {
+				accepted++
+				items[i] = item
+			}
+		}()
 	}
+	wg.Wait()
 	if accepted == 0 {
 		reason, _ := items[0]["reason"].(string)
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", reason)

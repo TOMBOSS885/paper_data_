@@ -139,12 +139,17 @@ export const uploadPapers = (files: File[]) => {
 }
 export const fileUrl = (id: string, kind: 'preview' | 'download') => `${API_BASE}/papers/${encodeURIComponent(id)}/${kind}`
 
+import { useQuery } from '@tanstack/react-query'
+
 export const listTags = () => api<{ data: { items: Tag[] } }>('/tags')
+export const useTags = () => useQuery<Tag[]>({ queryKey: ['tags'], queryFn: () => listTags().then(r => r.data.items), initialData: [] })
+
 export const createTag = (name: string, color: string) => api<Tag>('/tags', { method: 'POST', body: JSON.stringify({ name, color }) })
 export const deleteTag = async (id: number) => {
   await api(`/tags/${id}`, { method: 'DELETE' })
 }
 export const listCategories = () => api<{ data: { items: Category[] } }>('/categories')
+export const useCategories = () => useQuery<Category[]>({ queryKey: ['categories'], queryFn: () => listCategories().then(r => r.data.items), initialData: [] })
 export const createCategory = (payload: { name: string; parentId?: number | null; sortOrder?: number }) =>
   api<Category>('/categories', { method: 'POST', body: JSON.stringify(payload) })
 export const deleteCategory = async (id: number) => {
