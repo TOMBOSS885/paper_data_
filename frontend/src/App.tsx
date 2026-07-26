@@ -1,7 +1,8 @@
+import { Component } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Download, Eye, FolderPlus, LayoutDashboard, LogOut, Menu, Plus, Save, Search, Settings2, Star, Tag as TagIcon, Tags, Trash2, Upload, X } from 'lucide-react'
+import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Download, Eye, FolderPlus, LayoutDashboard, LogOut, Menu, Save, Search, Settings2, Star, Tag as TagIcon, Tags, Trash2, Upload, X } from 'lucide-react'
 import {
   ApiError,
   createAdmin,
@@ -11,7 +12,6 @@ import {
   dashboard,
   deleteCategory,
   deleteTag,
-  facets,
   fileUrl,
   listCategories,
   listTags,
@@ -27,7 +27,7 @@ import {
   updatePaperTags,
   uploadPapers,
 } from './lib/api'
-import type { Category, Facets, Paper, PaperDetail, Tag, UploadResult } from './lib/api'
+import type { Category, Paper, PaperDetail, Tag, UploadResult } from './lib/api'
 
 // 标签颜色映射：与 styles.css 中 .tag.<color> 的类名一致。
 const TAG_COLORS: { value: TagColor; label: string }[] = [
@@ -51,6 +51,39 @@ const statusLabel = (v?: string) => STATUS_LABELS[v ?? 'unread'] ?? '未读'
 const authorLine = (p: Paper) => {
   const names = (p.authors ?? []).map((a) => a?.name).filter(Boolean)
   return `${names.length ? names.join(', ') : '作者信息待补充'} · ${p.year ? `${p.year} 年` : '年份未知'}`
+}
+
+// 全局错误边界：阻止单个子组件的运行时崩溃导致整页变白。
+// 捕获到错误后展示降级 UI 与原始错误信息，同时提供重新载入入口。
+interface ErrorBoundaryState { error: Error | null }
+class PageErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null }
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error }
+  }
+  componentDidCatch(error: Error, info: unknown) {
+    // eslint-disable-next-line no-console
+    console.error('[PageErrorBoundary]', error, info)
+  }
+  render() {
+    if (this.state.error) {
+      const message = this.state.error.message || '未知错误'
+      return (
+        <div className="splash" style={{ padding: 24, textAlign: 'left' }}>
+          <div style={{ maxWidth: 560, background: '#fff', border: '1px solid #dfe7e4', borderRadius: 10, padding: 24 }}>
+            <h1 style={{ margin: '0 0 8px', color: '#a8433d' }}>页面加载失败</h1>
+            <p style={{ color: '#6d7b83', margin: '0 0 16px' }}>下方是该错误的原文。复制后可以贴给开发者，或用「重试」再次尝试。</p>
+            <pre style={{ background: '#fff5f4', border: '1px solid #f4cac5', padding: 12, borderRadius: 6, fontSize: 12, overflow: 'auto', maxHeight: 240, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#a8433d' }}>{message}</pre>
+            <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+              <button className="button primary" onClick={() => this.setState({ error: null })}>重试</button>
+              <button className="button secondary" onClick={() => (window.location.href = '/app/dashboard')}>回到概览</button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
 }
 
 function Shell({ children }: { children: ReactNode }) {
@@ -467,7 +500,7 @@ function Papers() {
               <option value="">全部分类</option>
               {allCategories.flatMap((c) => [
                 <option key={`c-${c.id}`} value={String(c.id)}>{c.name} ({c.paperCount})</option>,
-                ...c.children.map((sc) => <option key={`sc-${sc.id}`} value={String(sc.id)}>{c.name} / {sc.name} ({sc.paperCount})</option>),
+                ...(c.children ?? []).map((sc) => <option key={`sc-${sc.id}`} value={String(sc.id)}>{c.name} / {sc.name} ({sc.paperCount})</option>),
               ])}
             </select>
           </label>
@@ -911,13 +944,13 @@ function Taxonomy() {
       <div key={c.id} className="cat-node" style={{ paddingLeft: depth * 14 }}>
         <div className="cat-row">
           <button className="icon-button" type="button" aria-label={isOpen ? '收起' : '展开'} onClick={(e) => { e.stopPropagation(); setExpanded((m) => ({ ...m, [c.id]: !(m[c.id] ?? true) })) }}>
-            {c.children.length > 0 ? (isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span style={{ width: 14 }} />}
+            {(c.children ?? []).length > 0 ? (isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span style={{ width: 14 }} />}
           </button>
           <Link to={`/app/papers?category=${c.id}`}>{c.name}</Link>
-          <small>{c.paperCount} 篇</small>
+          <small>{c.paperCount ?? 0} 篇</small>
           <button className="icon-button danger" type="button" aria-label={`删除分类 ${c.name}`} onClick={remove}><Trash2 size={14} /></button>
         </div>
-        {isOpen && c.children.map((sc) => renderCategoryNode(sc, depth + 1))}
+        {isOpen && (c.children ?? []).map((sc) => renderCategoryNode(sc, depth + 1))}
       </div>
     )
   }
@@ -1122,16 +1155,18 @@ export default function App() {
   const fallback = initialized ? (authed ? '/app/dashboard' : '/auth/login') : '/setup'
 
   return (
-    <Routes>
-      <Route path="/setup" element={initialized ? <Navigate to="/auth/login" replace /> : <Setup />} />
-      <Route path="/auth/login" element={authed ? <Navigate to="/app/dashboard" replace /> : <Login />} />
-      <Route path="/app/dashboard" element={guard(<Dashboard />)} />
-      <Route path="/app/papers" element={guard(<Papers />)} />
-      <Route path="/app/papers/:id" element={guard(<PaperDetailPage />)} />
-      <Route path="/app/import" element={guard(<Import />)} />
-      <Route path="/app/taxonomy" element={guard(<Taxonomy />)} />
-      <Route path="/app/settings/security" element={guard(<Security />)} />
-      <Route path="*" element={<Navigate to={fallback} replace />} />
-    </Routes>
+    <PageErrorBoundary>
+      <Routes>
+        <Route path="/setup" element={initialized ? <Navigate to="/auth/login" replace /> : <Setup />} />
+        <Route path="/auth/login" element={authed ? <Navigate to="/app/dashboard" replace /> : <Login />} />
+        <Route path="/app/dashboard" element={guard(<Dashboard />)} />
+        <Route path="/app/papers" element={guard(<Papers />)} />
+        <Route path="/app/papers/:id" element={guard(<PaperDetailPage />)} />
+        <Route path="/app/import" element={guard(<Import />)} />
+        <Route path="/app/taxonomy" element={guard(<Taxonomy />)} />
+        <Route path="/app/settings/security" element={guard(<Security />)} />
+        <Route path="*" element={<Navigate to={fallback} replace />} />
+      </Routes>
+    </PageErrorBoundary>
   )
 }
