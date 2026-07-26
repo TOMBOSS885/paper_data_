@@ -1,5 +1,7 @@
 ARG GO_IMAGE=golang:1.22-alpine
 FROM ${GO_IMAGE} AS build
+ARG GOPROXY_URL=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY_URL}
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download

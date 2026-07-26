@@ -136,6 +136,18 @@ docker run --rm -v paper-knowledge-base_paper_uploads:/data -v $(pwd):/backup al
 **镜像拉取超时**
 - 在 `.env` 中把 `GO_IMAGE`/`NODE_IMAGE`/`NGINX_IMAGE` 换成云厂商镜像加速地址后重跑脚本。
 
+**构建时 `npm ci` 或 `go mod download` 失败（`Exit handler never called` / 超时）**
+- 服务器访问国外源慢导致依赖拉取中断。在 `.env` 中加入（或确认存在）：
+  ```env
+  NPM_REGISTRY=https://registry.npmmirror.com
+  GOPROXY_URL=https://goproxy.cn,direct
+  ```
+  然后重跑 `bash deploy.sh`。
+- 若仍失败,检查内存：`free -h`。1GB 及以下的服务器请先加 swap：
+  ```bash
+  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  ```
+
 **80 端口被占用**
 - 修改 `.env` 中 `HTTP_PORT`（如 8081）后重跑脚本，访问 `http://IP:8081`。
 

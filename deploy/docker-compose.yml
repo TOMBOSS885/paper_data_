@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile
       args:
         GO_IMAGE: "${GO_IMAGE:-golang:1.22-alpine}"
+        GOPROXY_URL: "${GOPROXY_URL:-https://proxy.golang.org,direct}"
     env_file: ../.env
     environment:
       SERVER_HOST: 0.0.0.0
@@ -33,6 +34,7 @@ services:
       args:
         NODE_IMAGE: "${NODE_IMAGE:-node:22-alpine}"
         NGINX_IMAGE: "${NGINX_IMAGE:-nginx:1.27-alpine}"
+        NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org}"
     depends_on: [api]
     ports: ["${HTTP_PORT:-80}:8080"]
     networks: [internal]
