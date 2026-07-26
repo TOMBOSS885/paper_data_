@@ -5,12 +5,17 @@ import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, use
 import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Download, Eye, FolderPlus, LayoutDashboard, LogOut, Menu, Save, Search, Settings2, Star, Tag as TagIcon, Tags, Trash2, Upload, X } from 'lucide-react'
 import {
   ApiError,
-  createAdmin,
+  bulkDeletePapers,
+  bulkSetFavorite,
+  bulkUpdatePaperCategories,
+  bulkUpdatePaperTags,
   changePassword,
+  createAdmin,
   createCategory,
   createTag,
   dashboard,
   deleteCategory,
+  deletePaperWithPassword,
   deleteTag,
   fileUrl,
   listCategories,
@@ -20,7 +25,6 @@ import {
   me,
   paper as fetchPaper,
   papers as fetchPapers,
-  removePaper,
   setupStatus,
   updatePaper,
   updatePaperCategories,
@@ -314,12 +318,10 @@ function Dashboard() {
   )
 }
 
-function PaperRow({ paper }: { paper: Paper }) {
+function PaperRow({ paper, selectable, selected, onToggle }: { paper: Paper; selectable?: boolean; selected?: boolean; onToggle?: (id: string) => void }) {
   const tags = paper.tags ?? []
   const cats = paper.categories ?? []
   const nav = useNavigate()
-  // 整行跳详情页，但分类/标签 chip 是独立的筛选链接：用按钮 + stopPropagation
-  // 避免嵌套 <a> / <button> 造成浏览器丢弃事件。
   const goDetail = () => nav(`/app/papers/${paper.id}`)
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -327,9 +329,19 @@ function PaperRow({ paper }: { paper: Paper }) {
       goDetail()
     }
   }
-  const stop = (e: React.MouseEvent) => e.stopPropagation()
+  const stop = (e: React.MouseEvent | React.ChangeEvent) => e.stopPropagation()
   return (
-    <div className="paper-row" role="link" tabIndex={0} onClick={goDetail} onKeyDown={onKey}>
+    <div className={`paper-row${selectable ? ' selectable' : ''}${selected ? ' selected' : ''}`} role="link" tabIndex={0} onClick={goDetail} onKeyDown={onKey}>
+      {selectable && (
+        <label className="row-check" onClick={stop}>
+          <input
+            type="checkbox"
+            checked={!!selected}
+            onChange={() => onToggle?.(paper.id)}
+            aria-label={`选择 ${paper.title}`}
+          />
+        </label>
+      )}
       <div className="paper-icon"><BookOpen size={18} /></div>
       <div className="paper-main">
         <strong>{paper.isFavorite ? '★ ' : ''}{paper.title}</strong>
@@ -361,6 +373,125 @@ function Empty({ title, description, action }: { title: string; description: str
   )
 }
 
+// 通用密码确认 modal：用于批量删除 / 批量打标 / 单篇删除等不可逆操作。
+// 受控 open / busy，提交时调用 onConfirm(password)。
+function PasswordModal({
+  open, title, description, confirmLabel = '确认', busy, onConfirm, onCancel,
+}: {
+  open: boolean
+  title: string
+  description: string
+  confirmLabel?: string
+  busy?: boolean
+  onConfirm: (password: string) => void
+  onCancel: () => void
+}) {
+  const [password, setPassword] = useState('')
+  const [err, setErr] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!open) {
+      setPassword('')
+      setErr('')
+      return
+    }
+    // 打开时聚焦输入框；按键 ESC 关闭。
+    const t = setTimeout(() => inputRef.current?.focus(), 30)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy) onCancel()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      clearTimeout(t)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open, busy, onCancel])
+
+  if (!open) return null
+  const submit = () => {
+    if (!password) {
+      setErr('请输入当前管理员密码')
+      return
+    }
+    setErr('')
+    onConfirm(password)
+  }
+  return (
+    <div className="modal-mask" onClick={busy ? undefined : onCancel}>
+      <div className="modal-panel" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <h2>{title}</h2>
+        <p className="muted">{description}</p>
+        {err && <div className="alert error">{err}</div>}
+        <label className="field">当前管理员密码
+          <input
+            ref={inputRef}
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submit() }}
+            autoComplete="current-password"
+          />
+        </label>
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onCancel} disabled={busy}>取消</button>
+          <button type="button" className="button primary" onClick={submit} disabled={busy}>{busy ? '处理中…' : confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 批量打标/批量分类 modal：先选一组标签或分类，确认后再走密码确认。
+function BatchTaxonomyModal({
+  open, kind, items, onConfirm, onCancel,
+}: {
+  open: boolean
+  kind: 'tags' | 'categories'
+  items: { id: number; name: string; color?: string }[]
+  onConfirm: (ids: number[]) => void
+  onCancel: () => void
+}) {
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  useEffect(() => {
+    if (open) setSelected(new Set())
+  }, [open])
+  if (!open) return null
+  const toggle = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const submit = () => onConfirm(Array.from(selected))
+  return (
+    <div className="modal-mask" onClick={onCancel}>
+      <div className="modal-panel wide" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <h2>{kind === 'tags' ? '批量打标签' : '批量分类'}</h2>
+        <p className="muted">替换模式：所选论文最终拥有下方勾选的标签/分类（其它会被移除）。</p>
+        {items.length === 0 ? (
+          <p className="muted">还没有{kind === 'tags' ? '标签' : '分类'}，先去「分类与标签」页面创建。</p>
+        ) : (
+          <div className="chip-grid">
+            {items.map((it) => (
+              <label key={it.id} className={`chip-pick${selected.has(it.id) ? ' on' : ''} ${kind === 'tags' ? `tag-${it.color ?? 'teal'}` : ''}`}>
+                <input type="checkbox" checked={selected.has(it.id)} onChange={() => toggle(it.id)} />
+                {kind === 'tags' ? `#${it.name}` : it.name}
+              </label>
+            ))}
+          </div>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onCancel}>取消</button>
+          <button type="button" className="button primary" onClick={submit} disabled={items.length === 0}>下一步</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Papers() {
   const [params, setParams] = useSearchParams()
   const q = params.get('q') ?? ''
@@ -380,6 +511,49 @@ function Papers() {
   const [draft, setDraft] = useState(q)
   const [allTags, setAllTags] = useState<Tag[]>([])
   const [allCategories, setAllCategories] = useState<Category[]>([])
+  // 批量选择：跨页会被自动清空，避免误操作。点击"全选本页"一键勾选当前 20 篇。
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  // 批量操作需要的 modal 状态机：null=无；先打开 taxonomy 选择 modal，再打开 password modal。
+  const [bulkState, setBulkState] = useState<null | {
+    kind: 'delete' | 'favorite-on' | 'favorite-off' | 'tags' | 'categories'
+    pendingIDs?: number[]
+  }>(null)
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [batchError, setBatchError] = useState('')
+
+  // 翻页 / 改筛选时清空选择（防止跨页批量）。
+  useEffect(() => {
+    setSelectedIds(new Set())
+  }, [page, q, status, sort, yearFrom, yearTo, favorite ? '1' : '0', tagFilter, categoryFilter])
+
+  const toggleOne = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else {
+        if (next.size >= 100) {
+          setBatchError('单次最多选择 100 篇')
+          return prev
+        }
+        next.add(id)
+      }
+      return next
+    })
+  }
+  const selectAllOnPage = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      for (const it of items) {
+        if (next.size >= 100) break
+        next.add(it.id)
+      }
+      if (items.length > 100 && prev.size === 0) setBatchError(`一次最多选 100 篇；本页 ${items.length} 篇仅勾选了前 100。`)
+      return next
+    })
+  }
+  const clearSelection = () => setSelectedIds(new Set())
+  const selectedCount = selectedIds.size
+  const allOnPageSelected = items.length > 0 && items.every((it) => selectedIds.has(it.id))
 
   const update = useCallback(
     (patch: Record<string, string | null>) => {
@@ -449,8 +623,61 @@ function Papers() {
     }
   }, [queryString])
 
+  const reload = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await fetchPapers(queryString)
+      setItems(r.data.items ?? [])
+      setTotal(r.data.total ?? 0)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [queryString])
+
+  // 批量操作入口：把 id 转成数组，调用后端 endpoint，处理 missing；成功后清选 + 重拉。
+  const runBulk = async (kind: 'delete' | 'favorite-on' | 'favorite-off' | 'tags' | 'categories', password: string, pendingIDs?: number[]) => {
+    if (selectedIds.size === 0) return
+    const ids = Array.from(selectedIds)
+    setBulkBusy(true)
+    setBatchError('')
+    try {
+      let res: { data: { deleted?: number; updated?: number; missing: string[] } }
+      if (kind === 'delete') {
+        res = await bulkDeletePapers(ids, password)
+      } else if (kind === 'favorite-on' || kind === 'favorite-off') {
+        res = await bulkSetFavorite(ids, kind === 'favorite-on', password)
+      } else if (kind === 'tags') {
+        res = await bulkUpdatePaperTags(ids, pendingIDs ?? [], password)
+      } else {
+        res = await bulkUpdatePaperCategories(ids, pendingIDs ?? [], password)
+      }
+      const missing = res.data.missing ?? []
+      const note = missing.length
+        ? `操作完成：${res.data.deleted ?? res.data.updated ?? ids.length} 篇成功，${missing.length} 篇已被删除或不存在`
+        : `操作完成：${res.data.deleted ?? res.data.updated ?? ids.length} 篇`
+      setSelectedIds(new Set())
+      await reload()
+      setError('')
+      // 顶部成功提示复用现有 notice 模式（如有），这里用 alert
+      setBatchError('')
+      setError(note)
+      setBulkState(null)
+    } catch (e) {
+      // 失败也保留选中状态，方便重试
+      setBatchError(errorMessage(e))
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
   const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const filtered = Boolean(q || status || favorite || yearFrom || yearTo || tagFilter || categoryFilter)
+
+  // 当 batchError 表示成功提示时（包含 "操作完成"），复用现有 alert.error 渲染。
+  const batchNotice = batchError.startsWith('操作完成') ? batchError : ''
+  const batchErr = batchError && !batchNotice ? batchError : ''
 
   return (
     <Shell>
@@ -462,6 +689,18 @@ function Papers() {
         </div>
         <Link className="button primary" to="/app/import"><Upload size={17} />导入论文</Link>
       </div>
+      {selectedCount > 0 && (
+        <div className="batch-bar" role="region" aria-label="批量操作">
+          <span className="batch-count">已选 <strong>{selectedCount}</strong> 篇</span>
+          <button type="button" className="button secondary" onClick={clearSelection}>清空选择</button>
+          <div className="batch-spacer" />
+          <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'favorite-on' })}><Star size={15} />批量加收藏</button>
+          <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'favorite-off' })}><Star size={15} />批量取消收藏</button>
+          <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'tags' })}><TagIcon size={15} />批量打标签</button>
+          <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'categories' })}><FolderPlus size={15} />批量分类</button>
+          <button type="button" className="button danger" onClick={() => setBulkState({ kind: 'delete' })}><Trash2 size={15} />批量删除</button>
+        </div>
+      )}
       <div className="toolbar">
         <div className="search-field">
           <Search size={17} />
@@ -517,6 +756,21 @@ function Papers() {
           <div className="filter-note">筛选条件会写入网址，可直接收藏或分享该链接。</div>
         </aside>
         <div className="panel paper-list">
+          {batchErr && <div className="alert error">{batchErr}</div>}
+          {batchNotice && <div className="alert ok">{batchNotice}</div>}
+          {!loading && items.length > 0 && (
+            <div className="select-all">
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={allOnPageSelected}
+                  onChange={(e) => (e.target.checked ? selectAllOnPage() : clearSelection())}
+                />
+                全选本页 {items.length} 篇
+              </label>
+              <small className="muted">单次批量最多 100 篇</small>
+            </div>
+          )}
           {error && <div className="alert error">{error}</div>}
           {loading ? (
             <div className="loading">正在查询论文…</div>
@@ -528,7 +782,15 @@ function Papers() {
             />
           ) : (
             <>
-              {items.map((p) => <PaperRow key={p.id} paper={p} />)}
+              {items.map((p) => (
+                <PaperRow
+                  key={p.id}
+                  paper={p}
+                  selectable
+                  selected={selectedIds.has(p.id)}
+                  onToggle={toggleOne}
+                />
+              ))}
               {lastPage > 1 && (
                 <div className="pager">
                   <button className="button secondary" disabled={page <= 1} onClick={() => update({ page: String(page - 1) })}>上一页</button>
@@ -540,6 +802,48 @@ function Papers() {
           )}
         </div>
       </div>
+      {bulkState && (
+        <BatchTaxonomyModal
+          open={bulkState.kind === 'tags' || bulkState.kind === 'categories'}
+          kind={bulkState.kind === 'tags' ? 'tags' : 'categories'}
+          items={
+            bulkState.kind === 'tags'
+              ? allTags.map((t) => ({ id: t.id, name: t.name, color: t.color }))
+              : allCategories.flatMap((c) => [
+                  { id: c.id, name: c.name },
+                  ...((c.children ?? []).map((sc) => ({ id: sc.id, name: `${c.name} / ${sc.name}` }))),
+                ])
+          }
+          onConfirm={(ids) => setBulkState({ kind: bulkState.kind, pendingIDs: ids })}
+          onCancel={() => setBulkState(null)}
+        />
+      )}
+      {bulkState && bulkState.kind !== 'tags' && bulkState.kind !== 'categories' && (
+        <PasswordModal
+          open
+          title={
+            bulkState.kind === 'delete' ? `批量删除 ${selectedCount} 篇`
+              : bulkState.kind === 'favorite-on' ? `批量加收藏（${selectedCount} 篇）`
+              : `批量取消收藏（${selectedCount} 篇）`
+          }
+          description="这是不可逆操作，请输入当前管理员密码以确认。"
+          confirmLabel="确认执行"
+          busy={bulkBusy}
+          onConfirm={(password) => runBulk(bulkState.kind, password)}
+          onCancel={() => { setBulkState(null); setBatchError('') }}
+        />
+      )}
+      {bulkState && (bulkState.kind === 'tags' || bulkState.kind === 'categories') && bulkState.pendingIDs && (
+        <PasswordModal
+          open
+          title={bulkState.kind === 'tags' ? `批量打标签（${selectedCount} 篇）` : `批量分类（${selectedCount} 篇）`}
+          description="替换模式：所选论文最终拥有上方勾选的标签/分类。其它将被移除。"
+          confirmLabel="确认"
+          busy={bulkBusy}
+          onConfirm={(password) => runBulk(bulkState.kind, password, bulkState.pendingIDs)}
+          onCancel={() => setBulkState(null)}
+        />
+      )}
     </Shell>
   )
 }
@@ -640,15 +944,18 @@ function PaperDetailPage() {
     }
   }
 
-  const destroy = async () => {
-    if (!window.confirm('确认删除这篇论文？删除后不会出现在列表中。')) return
+  // 单篇删除走密码再认证 modal，不可直接 confirm 跳过。
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const destroyWithPassword = async (password: string) => {
     setBusy(true)
     try {
-      await removePaper(id)
+      await deletePaperWithPassword(id, password)
+      setDeleteOpen(false)
       nav('/app/papers', { replace: true })
     } catch (e) {
       setError(errorMessage(e))
       setBusy(false)
+      setDeleteOpen(false)
     }
   }
 
@@ -698,7 +1005,7 @@ function PaperDetailPage() {
             <button className="button primary" disabled={busy} onClick={() => patch({ title: form.title.trim() || data.title, doi: form.doi.trim(), abstract: form.abstract, readingStatus: form.readingStatus }, '已保存')}>
               <Save size={16} />{busy ? '保存中…' : '保存修改'}
             </button>
-            <button className="button secondary" disabled={busy} onClick={destroy}><Trash2 size={16} />删除论文</button>
+            <button className="button secondary" disabled={busy} onClick={() => setDeleteOpen(true)}><Trash2 size={16} />删除论文</button>
           </div>
           <div className="taxonomy-editor">
             <h3>分类</h3>
@@ -748,6 +1055,15 @@ function PaperDetailPage() {
           )}
         </div>
       </div>
+      <PasswordModal
+        open={deleteOpen}
+        title="删除这篇论文"
+        description="这是不可逆操作。删除后不会出现在列表中。请输入当前管理员密码以确认。"
+        confirmLabel="确认删除"
+        busy={busy}
+        onConfirm={destroyWithPassword}
+        onCancel={() => setDeleteOpen(false)}
+      />
     </Shell>
   )
 }

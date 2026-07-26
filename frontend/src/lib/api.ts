@@ -110,6 +110,28 @@ export const updatePaper = (id: string, payload: Record<string, unknown>) =>
 export const removePaper = (id: string) => api(`/papers/${encodeURIComponent(id)}`, { method: 'DELETE' })
 export const updatePaperTags = (id: string, ids: number[]) => api(`/papers/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: JSON.stringify({ ids }) })
 export const updatePaperCategories = (id: string, ids: number[]) => api(`/papers/${encodeURIComponent(id)}/categories`, { method: 'PUT', body: JSON.stringify({ ids }) })
+export const deletePaperWithPassword = (id: string, password: string) =>
+  api(`/papers/${encodeURIComponent(id)}`, { method: 'DELETE', body: JSON.stringify({ password }) })
+export const bulkDeletePapers = (paperIds: string[], password: string) =>
+  api<{ data: { deleted: number; missing: string[] } }>(
+    '/papers/bulk/delete',
+    { method: 'POST', body: JSON.stringify({ paperIds, password }) },
+  )
+export const bulkUpdatePaperTags = (paperIds: string[], tagIds: number[], password: string) =>
+  api<{ data: { updated: number; missing: string[]; kind: string; ids: number[] } }>(
+    '/papers/bulk/tags',
+    { method: 'POST', body: JSON.stringify({ paperIds, ids: tagIds, password }) },
+  )
+export const bulkUpdatePaperCategories = (paperIds: string[], categoryIds: number[], password: string) =>
+  api<{ data: { updated: number; missing: string[]; kind: string; ids: number[] } }>(
+    '/papers/bulk/categories',
+    { method: 'POST', body: JSON.stringify({ paperIds, ids: categoryIds, password }) },
+  )
+export const bulkSetFavorite = (paperIds: string[], isFavorite: boolean, password: string) =>
+  api<{ data: { updated: number; missing: string[] } }>(
+    '/papers/bulk/favorite',
+    { method: 'POST', body: JSON.stringify({ paperIds, isFavorite, password }) },
+  )
 export const uploadPapers = (files: File[]) => {
   const form = new FormData()
   files.forEach((file) => form.append('files[]', file))

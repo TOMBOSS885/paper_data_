@@ -732,6 +732,102 @@ func (s *Server) categoryByID(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// confirmAdminPassword 用 bcrypt 比对管理员密码，用于敏感操作的二次校验。
+// 通过返回 true；失败时已经把错误写到 w，调用方应直接 return。
+// rateKey 给不同操作独立的限流桶，防止一个操作被穷举连带其它操作一起锁。
+func (s *Server) confirmAdminPassword(w http.ResponseWriter, r *http.Request, adminID uint64, password, rateKey string) bool {
+	if len(password) == 0 || len(password) > 256 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "password is required")
+		return false
+	}
+	if !s.limiter.allow(rateKey, 5, 15*time.Minute) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many attempts, please retry later")
+		return false
+	}
+	var hash string
+	if err := s.db.QueryRowContext(r.Context(), `SELECT password_hash FROM admins WHERE id=?`, adminID).Scan(&hash); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return false
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+		writeError(w, http.StatusForbidden, "invalid_credentials", "password is incorrect")
+		return false
+	}
+	return true
+}
+
+// parseBulkIDs 校验批量请求里的 paperIds：去重 + 长度 1..100。
+func parseBulkIDs(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("ids is required")
+	}
+	if len(raw) > 100 {
+		return nil, fmt.Errorf("too many ids (max 100)")
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, id := range raw {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("ids is required")
+	}
+	return out, nil
+}
+
+// bulkTxOnPapers 在事务里对一组 paperId 执行回调，回调负责实际 SQL。
+// 通用前置校验：papers 必须存在且未软删，缺失的 id 会在 missing 中返回（不影响其他）。
+func (s *Server) bulkTxOnPapers(ctx context.Context, paperIDs []string, do func(tx *sql.Tx, existingIDs []string) error) (existing []string, missing []string, err error) {
+	ph := placeholders(len(paperIDs))
+	args := make([]any, len(paperIDs))
+	for i, id := range paperIDs {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM papers WHERE id IN (`+ph+`) AND deleted_at IS NULL`, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			existing = append(existing, id)
+		}
+	}
+	rows.Close()
+	if len(existing) == 0 {
+		return nil, paperIDs, nil
+	}
+	existingSet := make(map[string]struct{}, len(existing))
+	for _, id := range existing {
+		existingSet[id] = struct{}{}
+	}
+	for _, id := range paperIDs {
+		if _, ok := existingSet[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	if err := do(tx, existing); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return existing, missing, nil
+}
+
 // updatePaperTaxonomy 处理 /api/papers/{id}/tags 和 /api/papers/{id}/categories 的 PUT。
 // 用单次事务替换绑定 + 维护 usage_count，避免应用层与数据库计数漂移。
 func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, paperID, kind string) {
@@ -900,6 +996,276 @@ func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, pap
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"paperId": paperID, "kind": kind, "ids": req.IDs})
+}
+
+// bulkDelete 软删一组论文；二次校验需要管理员密码。
+func (s *Server) bulkDelete(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	var req struct {
+		PaperIDs []string `json:"paperIds"`
+		Password string   `json:"password"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	paperIDs, err := parseBulkIDs(req.PaperIDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if !s.confirmAdminPassword(w, r, id, req.Password, fmt.Sprintf("bulk:delete:%d", id)) {
+		return
+	}
+	existing, missing, err := s.bulkTxOnPapers(r.Context(), paperIDs, func(tx *sql.Tx, ids []string) error {
+		ph := placeholders(len(ids))
+		args := make([]any, 0, len(ids))
+		args = append(args, time.Now().UTC())
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		_, err := tx.ExecContext(r.Context(),
+			`UPDATE papers SET deleted_at=UTC_TIMESTAMP(6), updated_at=UTC_TIMESTAMP(6) WHERE id IN (`+ph+`) AND deleted_at IS NULL`,
+			args[1:]...)
+		return err
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to delete papers")
+		return
+	}
+	// 顺手清理孤儿文件：上传目录里的 object_key 仍以 paper id 命名，物理删除留给运维（保留审计）。
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(existing), "missing": missing})
+}
+
+// bulkFavorite 一组论文设置 isFavorite；二次校验需要管理员密码。
+func (s *Server) bulkFavorite(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	var req struct {
+		PaperIDs   []string `json:"paperIds"`
+		IsFavorite bool     `json:"isFavorite"`
+		Password   string   `json:"password"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	paperIDs, err := parseBulkIDs(req.PaperIDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if !s.confirmAdminPassword(w, r, id, req.Password, fmt.Sprintf("bulk:favorite:%d", id)) {
+		return
+	}
+	existing, missing, err := s.bulkTxOnPapers(r.Context(), paperIDs, func(tx *sql.Tx, ids []string) error {
+		ph := placeholders(len(ids))
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, req.IsFavorite, time.Now().UTC())
+		for _, pid := range ids {
+			args = append(args, pid)
+		}
+		_, err := tx.ExecContext(r.Context(),
+			`UPDATE papers SET is_favorite=?, updated_at=UTC_TIMESTAMP(6) WHERE id IN (`+ph+`) AND deleted_at IS NULL`,
+			args...)
+		return err
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update favorites")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": len(existing), "missing": missing})
+}
+
+// bulkUpdateTaxonomy 一组论文的标签/分类替换（replace 模式）。
+// 复用 updatePaperTaxonomy 的差量计数逻辑：聚合所有 paper 的 add/remove，
+// 单次 UPDATE 维护 usage_count / paper_count，避免 N 次往返。
+func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind string) {
+	id, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+		return
+	}
+	var req struct {
+		PaperIDs []string `json:"paperIds"`
+		IDs      []uint64 `json:"ids"`
+		Password string   `json:"password"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	paperIDs, err := parseBulkIDs(req.PaperIDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if len(req.IDs) > 200 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "too many tag/category ids (max 200)")
+		return
+	}
+	seen := make(map[uint64]struct{}, len(req.IDs))
+	for _, x := range req.IDs {
+		if x == 0 {
+			continue
+		}
+		seen[x] = struct{}{}
+	}
+	if !s.confirmAdminPassword(w, r, id, req.Password, fmt.Sprintf("bulk:tag:%d", id)) {
+		return
+	}
+
+	// 校验 IDs 全部存在
+	if len(seen) > 0 {
+		args := make([]any, 0, len(seen))
+		for x := range seen {
+			args = append(args, x)
+		}
+		ph := placeholders(len(args))
+		table := "tags"
+		if kind == "categories" {
+			table = "categories"
+		}
+		rows, err := s.db.QueryContext(r.Context(), `SELECT id FROM `+table+` WHERE id IN (`+ph+`)`, args...)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+			return
+		}
+		found := 0
+		for rows.Next() {
+			var x uint64
+			if err := rows.Scan(&x); err == nil {
+				found++
+			}
+		}
+		rows.Close()
+		if found != len(seen) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "one or more ids do not exist")
+			return
+		}
+	}
+
+	joinTable := "paper_tags"
+	countColumn := "usage_count"
+	countTable := "tags"
+	if kind == "categories" {
+		joinTable = "paper_categories"
+		countColumn = "paper_count"
+		countTable = "categories"
+	}
+
+	existing, missing, err := s.bulkTxOnPapers(r.Context(), paperIDs, func(tx *sql.Tx, ids []string) error {
+		// 收集每个 paper 的旧绑定，便于在事务里算 add/remove
+		phOld := placeholders(len(ids))
+		argsOld := make([]any, len(ids))
+		for i, pid := range ids {
+			argsOld[i] = pid
+		}
+		oldQuery := `SELECT paper_id, ` + strings.TrimSuffix(joinTable, "s") + `_id FROM ` + joinTable + ` WHERE paper_id IN (` + phOld + `)`
+		rows, err := tx.QueryContext(r.Context(), oldQuery, argsOld...)
+		if err != nil {
+			return err
+		}
+		old := make(map[string]map[uint64]struct{}, len(ids))
+		for rows.Next() {
+			var pid string
+			var xid uint64
+			if err := rows.Scan(&pid, &xid); err != nil {
+				continue
+			}
+			if _, ok := old[pid]; !ok {
+				old[pid] = make(map[uint64]struct{})
+			}
+			old[pid][xid] = struct{}{}
+		}
+		rows.Close()
+
+		// 差量计数：全局 add / remove 聚合
+		addTotal := make(map[uint64]struct{})
+		removeTotal := make(map[uint64]struct{})
+
+		for _, pid := range ids {
+			oldSet := old[pid]
+			// 1) 清掉旧绑定
+			if _, err := tx.ExecContext(r.Context(), `DELETE FROM `+joinTable+` WHERE paper_id=?`, pid); err != nil {
+				return err
+			}
+			// 2) 写新绑定
+			if len(seen) > 0 {
+				var b strings.Builder
+				b.WriteString(`INSERT INTO `)
+				b.WriteString(joinTable)
+				b.WriteString(`(paper_id, `)
+				b.WriteString(strings.TrimSuffix(joinTable, "s"))
+				b.WriteString(`_id, created_at) VALUES `)
+				args := make([]any, 0, len(seen)*3)
+				now := time.Now().UTC()
+				i := 0
+				for xid := range seen {
+					if i > 0 {
+						b.WriteString(",")
+					}
+					b.WriteString("(?, ?, ?)")
+					args = append(args, pid, xid, now)
+					i++
+				}
+				if _, err := tx.ExecContext(r.Context(), b.String(), args...); err != nil {
+					return err
+				}
+			}
+			// 3) 算这篇的 add/remove
+			for xid := range seen {
+				if _, ok := oldSet[xid]; !ok {
+					addTotal[xid] = struct{}{}
+				}
+			}
+			for xid := range oldSet {
+				if _, ok := seen[xid]; !ok {
+					removeTotal[xid] = struct{}{}
+				}
+			}
+		}
+
+		adjustCountDelta := func(m map[uint64]struct{}, delta int) error {
+			if len(m) == 0 {
+				return nil
+			}
+			ids := make([]uint64, 0, len(m))
+			for x := range m {
+				ids = append(ids, x)
+			}
+			ph := placeholders(len(ids))
+			args := make([]any, 0, len(ids)+1)
+			args = append(args, delta)
+			for _, x := range ids {
+				args = append(args, x)
+			}
+			_, err := tx.ExecContext(r.Context(),
+				`UPDATE `+countTable+` SET `+countColumn+`=GREATEST(0, `+countColumn+`+?) WHERE id IN (`+ph+`)`,
+				args...)
+			return err
+		}
+		if err := adjustCountDelta(addTotal, +1); err != nil {
+			return err
+		}
+		if err := adjustCountDelta(removeTotal, -1); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update taxonomy")
+		return
+	}
+	out := make([]uint64, 0, len(req.IDs))
+	for _, x := range req.IDs {
+		out = append(out, x)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": len(existing), "missing": missing, "kind": kind, "ids": out})
 }
 
 func (s *Server) papers(w http.ResponseWriter, r *http.Request) {
@@ -1240,6 +1606,26 @@ func (s *Server) paperByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not_found", "paper not found")
 		return
 	}
+	// /api/papers/bulk/{op} 是一组批量端点，dispatch 到对应的 handler。
+	if parts[0] == "bulk" && len(parts) == 2 {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+			return
+		}
+		switch parts[1] {
+		case "delete":
+			s.bulkDelete(w, r)
+		case "tags":
+			s.bulkUpdateTaxonomy(w, r, "tags")
+		case "categories":
+			s.bulkUpdateTaxonomy(w, r, "categories")
+		case "favorite":
+			s.bulkFavorite(w, r)
+		default:
+			writeError(w, 404, "not_found", "bulk operation not found")
+		}
+		return
+	}
 	if len(parts) > 1 {
 		if parts[1] == "download" || parts[1] == "preview" {
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -1370,13 +1756,28 @@ func (s *Server) patchPaper(w http.ResponseWriter, r *http.Request, id string) {
 	s.getPaper(w, r, id)
 }
 func (s *Server) deletePaper(w http.ResponseWriter, r *http.Request, id string) {
-	if _, ok := s.authenticate(r); !ok {
-		writeError(w, 401, "unauthenticated", "authentication required")
+	adminID, ok := s.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
 		return
 	}
-	_, err := s.db.ExecContext(r.Context(), `UPDATE papers SET deleted_at=UTC_TIMESTAMP(6),updated_at=UTC_TIMESTAMP(6) WHERE id=? AND deleted_at IS NULL`, id)
+	// 单篇删除走密码再认证（不可逆操作，防误删 / 防 CSRF 以外的攻击）。
+	var req struct {
+		Password string `json:"password"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !s.confirmAdminPassword(w, r, adminID, req.Password, fmt.Sprintf("paper:delete:%d", adminID)) {
+		return
+	}
+	res, err := s.db.ExecContext(r.Context(), `UPDATE papers SET deleted_at=UTC_TIMESTAMP(6),updated_at=UTC_TIMESTAMP(6) WHERE id=? AND deleted_at IS NULL`, id)
 	if err != nil {
-		writeError(w, 500, "internal_error", "unable to delete paper")
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to delete paper")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "paper not found")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1495,7 +1896,7 @@ func subtleCompare(a, b string) int {
 	return 0
 }
 func requiresCSRF(r *http.Request) bool {
-	if r.Method != http.MethodPost && r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodPatch && r.Method != http.MethodDelete {
 		return false
 	}
 	switch r.URL.Path {
