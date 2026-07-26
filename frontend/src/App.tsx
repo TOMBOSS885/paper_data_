@@ -297,7 +297,7 @@ function Dashboard() {
           {(data?.recent ?? []).length === 0 ? (
             <Empty title="还没有论文" description="导入第一篇论文，建立你的研究地图。" action={<Link className="button secondary" to="/app/import"><Upload size={16} />开始导入</Link>} />
           ) : (
-            data?.recent.map((p) => <PaperRow key={p.id} paper={p} />)
+            (data?.recent ?? []).map((p) => <PaperRow key={p.id} paper={p} />)
           )}
         </div>
         <div className="panel">
@@ -975,7 +975,7 @@ function Taxonomy() {
           <div className="panel">
             <div className="panel-head">
               <h2>分类</h2>
-              <small>共 {categories.reduce((sum, c) => sum + 1 + c.children.length, 0)} 项</small>
+              <small>共 {categories.reduce((sum, c) => sum + 1 + ((c.children ?? []).length), 0)} 项</small>
             </div>
             {categories.length === 0 ? (
               <p className="muted">还没有分类。下方创建第一个根分类。</p>
