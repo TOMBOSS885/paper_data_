@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -1293,7 +1294,40 @@ func (s *Server) bulkFavorite(w http.ResponseWriter, r *http.Request) {
 // bulkUpdateTaxonomy 一组论文的标签/分类替换（replace 模式）。
 // 复用 updatePaperTaxonomy 的差量计数逻辑：聚合所有 paper 的 add/remove，
 // 单次 UPDATE 维护 usage_count / paper_count，避免 N 次往返。
+type bulkTaxonomySchema struct {
+	joinTable   string
+	joinColumn  string
+	countTable  string
+	countColumn string
+}
+
+func bulkTaxonomySchemaFor(kind string) (bulkTaxonomySchema, bool) {
+	switch kind {
+	case "tags":
+		return bulkTaxonomySchema{
+			joinTable:   "paper_tags",
+			joinColumn:  "tag_id",
+			countTable:  "tags",
+			countColumn: "usage_count",
+		}, true
+	case "categories":
+		return bulkTaxonomySchema{
+			joinTable:   "paper_categories",
+			joinColumn:  "category_id",
+			countTable:  "categories",
+			countColumn: "paper_count",
+		}, true
+	default:
+		return bulkTaxonomySchema{}, false
+	}
+}
+
 func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind string) {
+	schema, ok := bulkTaxonomySchemaFor(kind)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid taxonomy kind")
+		return
+	}
 	id, ok := s.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
@@ -1334,11 +1368,7 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 			args = append(args, x)
 		}
 		ph := placeholders(len(args))
-		table := "tags"
-		if kind == "categories" {
-			table = "categories"
-		}
-		rows, err := s.db.QueryContext(r.Context(), `SELECT id FROM `+table+` WHERE id IN (`+ph+`)`, args...)
+		rows, err := s.db.QueryContext(r.Context(), `SELECT id FROM `+schema.countTable+` WHERE id IN (`+ph+`)`, args...)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
 			return
@@ -1357,15 +1387,6 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 		}
 	}
 
-	joinTable := "paper_tags"
-	countColumn := "usage_count"
-	countTable := "tags"
-	if kind == "categories" {
-		joinTable = "paper_categories"
-		countColumn = "paper_count"
-		countTable = "categories"
-	}
-
 	existing, missing, err := s.bulkTxOnPapers(r.Context(), paperIDs, func(tx *sql.Tx, ids []string) error {
 		// 收集每个 paper 的旧绑定，便于在事务里算 add/remove
 		phOld := placeholders(len(ids))
@@ -1373,7 +1394,7 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 		for i, pid := range ids {
 			argsOld[i] = pid
 		}
-		oldQuery := `SELECT paper_id, ` + strings.TrimSuffix(joinTable, "s") + `_id FROM ` + joinTable + ` WHERE paper_id IN (` + phOld + `)`
+		oldQuery := `SELECT paper_id, ` + schema.joinColumn + ` FROM ` + schema.joinTable + ` WHERE paper_id IN (` + phOld + `)`
 		rows, err := tx.QueryContext(r.Context(), oldQuery, argsOld...)
 		if err != nil {
 			return err
@@ -1399,17 +1420,17 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 		for _, pid := range ids {
 			oldSet := old[pid]
 			// 1) 清掉旧绑定
-			if _, err := tx.ExecContext(r.Context(), `DELETE FROM `+joinTable+` WHERE paper_id=?`, pid); err != nil {
+			if _, err := tx.ExecContext(r.Context(), `DELETE FROM `+schema.joinTable+` WHERE paper_id=?`, pid); err != nil {
 				return err
 			}
 			// 2) 写新绑定
 			if len(seen) > 0 {
 				var b strings.Builder
 				b.WriteString(`INSERT INTO `)
-				b.WriteString(joinTable)
+				b.WriteString(schema.joinTable)
 				b.WriteString(`(paper_id, `)
-				b.WriteString(strings.TrimSuffix(joinTable, "s"))
-				b.WriteString(`_id, created_at) VALUES `)
+				b.WriteString(schema.joinColumn)
+				b.WriteString(`, created_at) VALUES `)
 				args := make([]any, 0, len(seen)*3)
 				now := time.Now().UTC()
 				i := 0
@@ -1458,7 +1479,7 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 				args = append(args, x)
 			}
 			_, err := tx.ExecContext(r.Context(),
-				`UPDATE `+countTable+` SET `+countColumn+`=GREATEST(0, CAST(`+countColumn+` AS SIGNED)+CASE id`+cases.String()+` ELSE 0 END) WHERE id IN (`+ph+`)`,
+				`UPDATE `+schema.countTable+` SET `+schema.countColumn+`=GREATEST(0, CAST(`+schema.countColumn+` AS SIGNED)+CASE id`+cases.String()+` ELSE 0 END) WHERE id IN (`+ph+`)`,
 				args...)
 			return err
 		}
@@ -1471,6 +1492,7 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 		return nil
 	})
 	if err != nil {
+		log.Printf("bulk taxonomy update failed: kind=%s papers=%d associations=%d: %v", kind, len(paperIDs), len(seen), err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update taxonomy")
 		return
 	}
