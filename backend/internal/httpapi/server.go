@@ -112,8 +112,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/papers", s.papers)
 	mux.HandleFunc("/api/papers/", s.paperByID)
 
-	mux.HandleFunc("/api/citation/formats", s.citationFormats)
-	mux.HandleFunc("/api/citation/formats/", s.citationFormatByID)
 	return s.withMiddleware(mux)
 }
 
@@ -1832,7 +1830,7 @@ func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[
 		}
 	}
 	f.Seek(0, 0)
-	
+
 	if err := os.MkdirAll(s.cfg.UploadDir, 0700); err != nil {
 		return nil, err
 	}
@@ -1930,14 +1928,6 @@ func (s *Server) paperByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.reextractPaper(w, r, parts[0])
-			return
-		}
-		if parts[1] == "cite" {
-			if r.Method != http.MethodGet {
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				return
-			}
-			s.citePaper(w, r, parts[0])
 			return
 		}
 		writeError(w, 404, "not_found", "paper not found")

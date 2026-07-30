@@ -1,6 +1,6 @@
 # Paper Atlas 前端
 
-React 19 + Vite + TypeScript 的单管理员论文工作台。会话由后端 HttpOnly Cookie 管理，前端不会把 token 写入 `localStorage` 或 `sessionStorage`。
+React 19 + Vite + TypeScript 的单管理员论文工作台。界面支持明暗主题、响应式侧栏和移动端筛选面板。会话由后端 HttpOnly Cookie 管理，前端不会把 token 写入 `localStorage` 或 `sessionStorage`。
 
 ## 本地开发
 
@@ -17,4 +17,4 @@ npm run dev
 npm run build
 ```
 
-镜像构建由 `frontend/Dockerfile` 完成，最终容器使用非 root Nginx 监听 8080。反向代理规则位于 `deploy/nginx.conf`，由 Compose 将宿主机 80 映射到容器 8080。
+镜像构建由 `frontend/Dockerfile` 完成，最终容器使用 Nginx 托管静态文件并反代 `/api/`。监听端口由根目录 `.env` 的 `HTTP_PORT` 控制，生产环境推荐由宝塔 Nginx 反向代理到 `127.0.0.1:HTTP_PORT`。

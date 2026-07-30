@@ -56,7 +56,7 @@ export async function api<T>(path: string, init: Options = {}): Promise<T> {
   return response.json()
 }
 
-export type Author = { name: string }
+export type Author = { name: string } | string
 export type Tag = { id: number; name: string; color: string; usageCount?: number }
 export type Category = {
   id: number
@@ -142,14 +142,14 @@ export const fileUrl = (id: string, kind: 'preview' | 'download') => `${API_BASE
 import { useQuery } from '@tanstack/react-query'
 
 export const listTags = () => api<{ data: { items: Tag[] } }>('/tags')
-export const useTags = () => useQuery<Tag[]>({ queryKey: ['tags'], queryFn: () => listTags().then(r => r.data.items), initialData: [] })
+export const useTags = () => useQuery<Tag[]>({ queryKey: ['tags'], queryFn: () => listTags().then(r => r.data.items), placeholderData: [] })
 
 export const createTag = (name: string, color: string) => api<Tag>('/tags', { method: 'POST', body: JSON.stringify({ name, color }) })
 export const deleteTag = async (id: number) => {
   await api(`/tags/${id}`, { method: 'DELETE' })
 }
 export const listCategories = () => api<{ data: { items: Category[] } }>('/categories')
-export const useCategories = () => useQuery<Category[]>({ queryKey: ['categories'], queryFn: () => listCategories().then(r => r.data.items), initialData: [] })
+export const useCategories = () => useQuery<Category[]>({ queryKey: ['categories'], queryFn: () => listCategories().then(r => r.data.items), placeholderData: [] })
 export const createCategory = (payload: { name: string; parentId?: number | null; sortOrder?: number }) =>
   api<Category>('/categories', { method: 'POST', body: JSON.stringify(payload) })
 export const deleteCategory = async (id: number) => {
@@ -170,16 +170,16 @@ export const TAG_COLORS: { value: string; label: string }[] = [
 	{ value: 'violet', label: '紫罗兰' },
 ]
 
-export type CitationFormat = { id: string | number; name: string; builtin: boolean; template: string }
-export const citationFormats = () => api<{ items: CitationFormat[] }>('/citation/formats')
-export const createCitationFormat = (payload: { name: string; template: string }) => api<CitationFormat>('/citation/formats', { method: 'POST', body: JSON.stringify(payload) })
-export const updateCitationFormat = (id: string | number, payload: { name?: string; template?: string }) => api(`/citation/formats/${id}`, { method: 'PATCH', body: JSON.stringify(payload) })
-export const deleteCitationFormat = (id: string | number) => api(`/citation/formats/${id}`, { method: 'DELETE' })
-
-export const citePaper = (id: string, format: string) => api<{ citation: string }>(`/papers/${encodeURIComponent(id)}/cite?format=${encodeURIComponent(format)}`)
-export const reextractPaper = (id: string) => api<{ status?: string, Title?: string, Authors?: string[], Year?: number, Subject?: string }>(`/papers/${encodeURIComponent(id)}/reextract`, { method: 'POST' })
+export const reextractPaper = (id: string) =>
+  api<{ data: { status?: string; Title?: string; Authors?: string[]; Year?: number; Subject?: string } }>(
+    `/papers/${encodeURIComponent(id)}/reextract`,
+    { method: 'POST' },
+  ).then((response) => response.data)
 export const extractPapersPreview = (files: File[]) => {
   const form = new FormData()
   files.forEach((file) => form.append('files', file))
-  return api<{ fileName: string, meta: { Title?: string, Authors?: string[], Year?: number, Subject?: string } }[]>('/papers/extract', { method: 'POST', body: form })
+  return api<{ data: { fileName: string; meta: { Title?: string; Authors?: string[]; Year?: number; Subject?: string } }[] }>(
+    '/papers/extract',
+    { method: 'POST', body: form },
+  ).then((response) => response.data)
 }

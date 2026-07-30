@@ -5,7 +5,7 @@ React + Go + MySQL 的单管理员论文知识库。部署步骤见 [`DEPLOYMENT
 ## 当前实现
 
 - Go API：健康检查、一次性初始化（SETUP_SECRET）、邮箱 + 密码登录、修改密码（吊销全部会话）、Cookie 会话、CSRF、论文检索（关键词 + 阅读状态 + 年份 + 收藏 + 标签/分类 + 排序 + 分页）、上传、详情、乐观锁更新、预览/下载、软删除、Dashboard、分类聚合（`/api/facets`）、标签与分类 CRUD 与论文绑定。
-- React：`/setup`、登录、概览、论文库（筛选条件写入 URL）、论文详情（编辑元数据/收藏/预览/下载/删除、标签与分类多选打标）、导入（逐文件结果反馈）、分类与标签管理（创建/删除、树形展开、颜色选择）、安全设置；使用 HttpOnly Cookie 和自动 CSRF 头，会话失效自动回登录页。
+- React：`/setup`、登录、概览、论文库（筛选条件写入 URL）、论文详情（编辑元数据/收藏/预览/下载/删除、标签与分类多选打标）、导入（逐文件结果反馈）、分类与标签管理（创建/删除、树形展开、颜色选择）、安全设置；支持明暗主题和移动端筛选面板，使用 HttpOnly Cookie 和自动 CSRF 头，会话失效自动回登录页。
 - Docker：`deploy/docker-compose.yml` 包含 API 和 Web 两个容器，均运行在宿主机网络上；API 按 `.env` 中的配置经 `127.0.0.1` 直连服务器 MySQL（无需改 bind-address 和防火墙），Web(Nginx) 托管前端并反代 `/api/`。
 - 不依赖 Redis 和 SMTP：限流在 API 进程内存中实现，登录无需邮箱验证码。
 
@@ -43,7 +43,7 @@ npm run dev
 ## 当前验证结果
 
 - `backend`: `gofmt`、`go test ./...`、`go vet ./...` 已通过。
-- `frontend`: `npm run build` 已通过。
+- `frontend`: `npm run build`、`npm test` 已通过。
 - 本机未安装 Docker CLI，`docker compose up` 需在部署服务器上执行。
 
 安全注意：不要提交 `.env`、上传目录或数据库凭据。生产环境建议使用 HTTPS 反向代理并将 `COOKIE_SECURE` 设为 `true`。

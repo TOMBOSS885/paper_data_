@@ -5,4 +5,5 @@ backend/uploads/
 .gocache/
 .gomodcache/
 frontend-dev*.log
+.playwright-cli/
 *.log

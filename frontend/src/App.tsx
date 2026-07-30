@@ -2,7 +2,7 @@ import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Download, Eye, FolderPlus, LayoutDashboard, LogOut, Menu, Save, Search, Settings2, Star, Tag as TagIcon, Tags, Trash2, Upload, X } from 'lucide-react'
+import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, LayoutDashboard, LogOut, Menu, Moon, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, Upload, X } from 'lucide-react'
 import {
   ApiError,
   bulkDeletePapers,
@@ -27,6 +27,7 @@ import {
   me,
   paper as fetchPaper,
   papers as fetchPapers,
+  reextractPaper,
   setupStatus,
   updatePaper,
   updatePaperCategories,
@@ -35,7 +36,6 @@ import {
 } from './lib/api'
 import type { Category, Paper, PaperDetail, Tag, UploadResult } from './lib/api'
 import { extractPapersPreview } from './lib/api'
-import { CitationSettingsPage, CitationModal } from './components/Citation'
 
 // 标签颜色映射：与 styles.css 中 .tag.<color> 的类名一致。
 const TAG_COLORS: { value: TagColor; label: string }[] = [
@@ -57,8 +57,40 @@ const STATUS_LABELS: Record<string, string> = { unread: '未读', reading: '阅�
 const errorMessage = (e: unknown) => (e instanceof ApiError || e instanceof Error ? e.message : '操作失败，请重试')
 const statusLabel = (v?: string) => STATUS_LABELS[v ?? 'unread'] ?? '未读'
 const authorLine = (p: Paper) => {
-  const names = (p.authors ?? []).map((a) => a?.name).filter(Boolean)
+  const names = (p.authors ?? []).map((a) => (typeof a === 'string' ? a : a?.name)).filter(Boolean)
   return `${names.length ? names.join(', ') : '作者信息待补充'} · ${p.year ? `${p.year} 年` : '年份未知'}`
+}
+
+type ThemeMode = 'light' | 'dark'
+
+function initialTheme(): ThemeMode {
+  if (typeof window === 'undefined') return 'light'
+  const stored = window.localStorage.getItem('paper-atlas-theme')
+  if (stored === 'light' || stored === 'dark') return stored
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function ThemeToggle({ compact = false }: { compact?: boolean }) {
+  const [theme, setTheme] = useState<ThemeMode>(initialTheme)
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    window.localStorage.setItem('paper-atlas-theme', theme)
+  }, [theme])
+
+  const next = theme === 'dark' ? 'light' : 'dark'
+  return (
+    <button
+      className={compact ? 'icon-button theme-toggle compact' : 'theme-toggle'}
+      type="button"
+      onClick={() => setTheme(next)}
+      aria-label={next === 'dark' ? '切换到深色模式' : '切换到浅色模式'}
+      title={next === 'dark' ? '深色模式' : '浅色模式'}
+    >
+      {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+      {!compact && <span>{theme === 'dark' ? '浅色模式' : '深色模式'}</span>}
+    </button>
+  )
 }
 
 // 全局错误边界：阻止单个子组件的运行时崩溃导致整页变白。
@@ -105,7 +137,6 @@ export function Shell({ children }: { children: ReactNode }) {
     { to: '/app/import', label: '导入论文', icon: Upload },
     { to: '/app/taxonomy', label: '分类与标签', icon: Tags },
     { to: '/app/settings/security', label: '安全设置', icon: Settings2 },
-    { to: '/app/settings/citations', label: '引用格式', icon: BookOpen },
   ]
 
   // ⌘K / Ctrl+K 聚焦全局搜索框。
@@ -128,15 +159,16 @@ export function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div className="app-shell">
+      <button className={open ? 'sidebar-backdrop open' : 'sidebar-backdrop'} onClick={() => setOpen(false)} aria-label="关闭导航遮罩" />
       <aside className={open ? 'sidebar open' : 'sidebar'}>
         <div className="brand">
           <span className="brand-mark">PA</span>
-          <span>Paper Atlas</span>
+          <span className="brand-copy"><strong>Paper Atlas</strong><small>Research library</small></span>
           <button className="icon-button mobile-close" onClick={() => setOpen(false)} aria-label="关闭导航"><X size={18} /></button>
         </div>
         <nav>
           {links.map(({ to, label, icon: Icon }) => (
-            <Link key={to} to={to} onClick={() => setOpen(false)} className={loc.pathname.startsWith(to) ? 'nav-link active' : 'nav-link'}>
+            <Link key={to} to={to} onClick={() => setOpen(false)} aria-current={loc.pathname.startsWith(to) ? 'page' : undefined} className={loc.pathname.startsWith(to) ? 'nav-link active' : 'nav-link'}>
               <Icon size={18} /><span>{label}</span>
             </Link>
           ))}
@@ -163,7 +195,7 @@ export function Shell({ children }: { children: ReactNode }) {
             />
             <kbd>⌘ K</kbd>
           </div>
-          <div className="top-actions"><span className="avatar">A</span></div>
+          <div className="top-actions"><ThemeToggle compact /><span className="avatar">A</span></div>
         </header>
         <main>{children}</main>
       </div>
@@ -199,8 +231,9 @@ function Setup() {
 
   return (
     <div className="auth-page">
+      <div className="auth-theme"><ThemeToggle /></div>
       <div className="auth-panel">
-        <div className="brand large"><span className="brand-mark">PA</span><span>Paper Atlas</span></div>
+        <div className="brand large"><span className="brand-mark">PA</span><span className="brand-copy"><strong>Paper Atlas</strong><small>Research library</small></span></div>
         <p className="eyebrow">首次部署</p>
         <h1>创建管理员</h1>
         <p className="muted">初始化只执行一次。请输入部署时设置的初始化令牌。</p>
@@ -237,8 +270,9 @@ function Login() {
 
   return (
     <div className="auth-page">
+      <div className="auth-theme"><ThemeToggle /></div>
       <div className="auth-panel">
-        <div className="brand large"><span className="brand-mark">PA</span><span>Paper Atlas</span></div>
+        <div className="brand large"><span className="brand-mark">PA</span><span className="brand-copy"><strong>Paper Atlas</strong><small>Research library</small></span></div>
         <p className="eyebrow">管理员入口</p>
         <h1>欢迎回来</h1>
         <p className="muted">你的论文、笔记和研究脉络都在这里。</p>
@@ -277,11 +311,11 @@ function Dashboard() {
       .catch((e) => setError(errorMessage(e)))
   }, [])
 
-  const stats: [string, string | number, string][] = [
-    ['论文总数', data?.totalPapers ?? '—', '篇'],
-    ['近 30 天导入', data?.importedLast30Days ?? '—', '篇'],
-    ['待阅读', data?.unread ?? '—', '篇'],
-    ['存储占用', data ? ((data.storageBytes || 0) / 1073741824).toFixed(2) : '—', 'GB'],
+  const stats = [
+    { label: '论文总数', value: data?.totalPapers ?? '—', unit: '篇', icon: BookOpen, tone: 'blue' },
+    { label: '近 30 天导入', value: data?.importedLast30Days ?? '—', unit: '篇', icon: TrendingUp, tone: 'green' },
+    { label: '待阅读', value: data?.unread ?? '—', unit: '篇', icon: Clock3, tone: 'amber' },
+    { label: '存储占用', value: data ? ((data.storageBytes || 0) / 1073741824).toFixed(2) : '—', unit: 'GB', icon: Database, tone: 'rose' },
   ]
 
   return (
@@ -296,9 +330,20 @@ function Dashboard() {
       </div>
       {error && <div className="alert error">{error}</div>}
       <section className="stat-grid">
-        {stats.map(([label, value, unit]) => (
-          <div className="stat-card" key={label}><span>{label}</span><strong>{value}</strong><small>{unit}</small></div>
+        {stats.map(({ label, value, unit, icon: Icon, tone }) => (
+          <div className={`stat-card tone-${tone}`} key={label}>
+            <div className="stat-card-head"><span>{label}</span><span className="stat-icon"><Icon size={19} /></span></div>
+            <div><strong>{value}</strong><small>{unit}</small></div>
+          </div>
         ))}
+      </section>
+      <section className="dashboard-banner">
+        <div className="dashboard-banner-icon"><TrendingUp size={22} /></div>
+        <div><h2>继续构建你的研究脉络</h2><p>集中整理新论文，再通过阅读状态、分类和标签保持资料库可检索。</p></div>
+        <div className="dashboard-banner-actions">
+          <Link to="/app/import">导入论文</Link>
+          <Link to="/app/papers">浏览论文库</Link>
+        </div>
       </section>
       <section className="content-grid">
         <div className="panel">
@@ -516,8 +561,9 @@ function Papers() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [draft, setDraft] = useState(q)
-  const { data: allTags } = useTags()
-  const { data: allCategories } = useCategories()
+  const [filtersOpen, setFiltersOpen] = useState(false)
+  const { data: allTags = [] } = useTags()
+  const { data: allCategories = [] } = useCategories()
   // 批量选择：跨页会被自动清空，避免误操作。点击"全选本页"一键勾选当前 20 篇。
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   // 批量操作需要的 modal 状态机：null=无；先打开 taxonomy 选择 modal，再打开 password modal。
@@ -663,9 +709,7 @@ function Papers() {
       setSelectedIds(new Set())
       await reload()
       setError('')
-      // 顶部成功提示复用现有 notice 模式（如有），这里用 alert
-      setBatchError('')
-      setError(note)
+      setBatchError(note)
       setBulkState(null)
     } catch (e) {
       // 失败也保留选中状态，方便重试
@@ -710,6 +754,9 @@ function Papers() {
           <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="搜索标题、作者、DOI、期刊…" />
           {draft && <button className="icon-button" aria-label="清空搜索" onClick={() => setDraft('')}><X size={15} /></button>}
         </div>
+        <button type="button" className={filtered ? 'button secondary filter-toggle active' : 'button secondary filter-toggle'} onClick={() => setFiltersOpen((value) => !value)} aria-expanded={filtersOpen}>
+          <Filter size={16} />筛选{filtered ? ' · 已启用' : ''}
+        </button>
         <select aria-label="排序" value={sort} onChange={(e) => update({ sort: e.target.value })}>
           <option value="newest">最近添加</option>
           <option value="oldest">最早添加</option>
@@ -719,8 +766,8 @@ function Papers() {
         </select>
       </div>
       <div className="papers-layout">
-        <aside className="filters">
-          <h3>筛选</h3>
+        <aside className={filtersOpen ? 'filters open' : 'filters'}>
+          <div className="filter-head"><h3>筛选</h3><button type="button" className="icon-button filter-close" aria-label="关闭筛选" onClick={() => setFiltersOpen(false)}><X size={16} /></button></div>
           <label>
             阅读状态
             <select value={status} onChange={(e) => update({ status: e.target.value })}>
@@ -860,19 +907,10 @@ function PaperDetailPage() {
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
-  const { data: allTags } = useTags()
-  const { data: allCategories } = useCategories()
+  const { data: allTags = [] } = useTags()
+  const { data: allCategories = [] } = useCategories()
   const [selectedTagIDs, setSelectedTagIDs] = useState<number[]>([])
   const [selectedCategoryIDs, setSelectedCategoryIDs] = useState<number[]>([])
-  const [citationModalOpen, setCitationModalOpen] = useState(false)
-
-  useEffect(() => {
-    const handleOpen = (e: any) => {
-      if (e.detail === id) setCitationModalOpen(true)
-    }
-    document.addEventListener('open-citation', handleOpen)
-    return () => document.removeEventListener('open-citation', handleOpen)
-  }, [id])
 
   const apply = (detail: PaperDetail) => {
     setData(detail)
@@ -1036,7 +1074,7 @@ function PaperDetailPage() {
               if (busy) return;
               setBusy(true); setError(''); setNotice('');
               try {
-                const res = await import('./lib/api').then(m => m.reextractPaper(id));
+                const res = await reextractPaper(id)
                 setNotice('重新识别完成');
                 if (res) {
                   const toUpdate: Partial<PaperDetail> = {}
@@ -1052,10 +1090,6 @@ function PaperDetailPage() {
                 setBusy(false);
               }
             }}><BookOpen size={16} />重新识别</button>
-            <button className="button secondary" onClick={() => import('react').then(() => {
-               // Use a custom event or just local state to open citation modal
-               document.dispatchEvent(new CustomEvent('open-citation', { detail: id }))
-            })}><BookOpen size={16} />引用</button>
             <button className="button secondary" disabled={busy} onClick={() => setDeleteOpen(true)}><Trash2 size={16} />删除论文</button>
           </div>
           <div className="taxonomy-editor">
@@ -1115,7 +1149,6 @@ function PaperDetailPage() {
         onConfirm={destroyWithPassword}
         onCancel={() => setDeleteOpen(false)}
       />
-      {citationModalOpen && <CitationModal paperId={id} onClose={() => setCitationModalOpen(false)} />}
     </Shell>
   )
 }
@@ -1560,7 +1593,6 @@ export default function App() {
         <Route path="/app/import" element={guard(<Import />)} />
         <Route path="/app/taxonomy" element={guard(<Taxonomy />)} />
         <Route path="/app/settings/security" element={guard(<Security />)} />
-        <Route path="/app/settings/citations" element={guard(<CitationSettingsPage />)} />
         <Route path="*" element={<Navigate to={fallback} replace />} />
       </Routes>
     </PageErrorBoundary>
