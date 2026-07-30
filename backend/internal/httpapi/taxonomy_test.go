@@ -1,6 +1,10 @@
 package httpapi
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestBulkTaxonomySchemaFor(t *testing.T) {
 	tests := []struct {
@@ -29,5 +33,20 @@ func TestBulkTaxonomySchemaFor(t *testing.T) {
 
 	if _, ok := bulkTaxonomySchemaFor("invalid"); ok {
 		t.Fatal("invalid taxonomy kind was accepted")
+	}
+}
+
+func TestWithNoStoreHeaders(t *testing.T) {
+	handler := withNoStoreHeaders(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	recorder := httptest.NewRecorder()
+	handler(recorder, httptest.NewRequest(http.MethodGet, "/api/tags", nil))
+
+	if got := recorder.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := recorder.Header().Get("Vary"); got != "Accept-Encoding, Cookie" {
+		t.Fatalf("Vary = %q", got)
 	}
 }

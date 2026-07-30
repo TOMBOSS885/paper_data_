@@ -2,6 +2,7 @@ import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, LayoutDashboard, LogOut, Menu, Moon, RotateCcw, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, Upload, X } from 'lucide-react'
 import {
   ApiError,
@@ -38,6 +39,7 @@ import {
 } from './lib/api'
 import type { Category, Paper, PaperDetail, Tag, TrashPaper, UploadResult } from './lib/api'
 import { extractPapersPreview } from './lib/api'
+import { removeCategoryFromTree } from './lib/taxonomy'
 
 // 标签颜色映射：与 styles.css 中 .tag.<color> 的类名一致。
 const TAG_COLORS: { value: TagColor; label: string }[] = [
@@ -1425,6 +1427,7 @@ function Import() {
 }
 
 function Taxonomy() {
+  const queryClient = useQueryClient()
   const [tab, setTab] = useState<'tags' | 'categories'>('categories')
   const { data: tags = [], refetch: refetchTags } = useTags()
   const { data: categories = [], refetch: refetchCategories } = useCategories()
@@ -1503,8 +1506,9 @@ function Taxonomy() {
       if (!window.confirm(`删除分类「${c.name}」？会同时移除其子分类与已关联论文的绑定。`)) return
       try {
         await deleteCategory(c.id)
-        const refreshErr = await reload()
-        if (refreshErr) console.warn('刷新失败', refreshErr)
+        queryClient.setQueryData<Category[]>(['categories'], (current) => removeCategoryFromTree(current ?? [], c.id))
+        const refresh = await refetchCategories()
+        if (refresh.error) console.warn('刷新分类失败', refresh.error)
         setError('')
         setNotice(`已删除分类：${c.name}`)
       } catch (e) {
@@ -1594,8 +1598,9 @@ function Taxonomy() {
                         if (!window.confirm(`删除标签「${t.name}」？所有论文的该标签关联都会被移除。`)) return
                         try {
                           await deleteTag(t.id)
-                          const refreshErr = await reload()
-                          if (refreshErr) console.warn('刷新失败', refreshErr)
+                          queryClient.setQueryData<Tag[]>(['tags'], (current) => (current ?? []).filter((item) => item.id !== t.id))
+                          const refresh = await refetchTags()
+                          if (refresh.error) console.warn('刷新标签失败', refresh.error)
                           setError('')
                           setNotice(`已删除标签：${t.name}`)
                         } catch (err) {

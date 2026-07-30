@@ -103,11 +103,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/me", s.me)
 	mux.HandleFunc("/api/auth/password", s.changePassword)
 	mux.HandleFunc("/api/dashboard", s.dashboard)
-	// 只读、低频变动接口走 5 分钟私有缓存 + gzip。
-	// Vary: Cookie 防止登录态切换命中旧缓存；Cache-Control: private 防止 CDN 共享。
+	// 低频变动的只读聚合接口走 5 分钟私有缓存；可在管理页直接修改的
+	// 标签和分类必须禁用 HTTP 缓存，客户端数据缓存由 React Query 负责。
 	mux.HandleFunc("/api/facets", withCacheHeaders(300, gzipResponse(s.facets)))
-	mux.HandleFunc("/api/tags", withCacheHeaders(300, gzipResponse(s.tags)))
-	mux.HandleFunc("/api/categories", withCacheHeaders(300, gzipResponse(s.categories)))
+	mux.HandleFunc("/api/tags", withNoStoreHeaders(gzipResponse(s.tags)))
+	mux.HandleFunc("/api/categories", withNoStoreHeaders(gzipResponse(s.categories)))
 	mux.HandleFunc("/api/tags/", gzipResponse(s.tagByID))
 	mux.HandleFunc("/api/categories/", gzipResponse(s.categoryByID))
 	mux.HandleFunc("/api/papers/extract", s.extractPapers)
@@ -124,6 +124,14 @@ func withCacheHeaders(maxAge int, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", maxAge))
 		// 同时按 gzip 维度和 session 维度变化：登录后或登出后立即不命中旧缓存。
+		w.Header().Set("Vary", "Accept-Encoding, Cookie")
+		h(w, r)
+	}
+}
+
+func withNoStoreHeaders(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private, no-store")
 		w.Header().Set("Vary", "Accept-Encoding, Cookie")
 		h(w, r)
 	}
