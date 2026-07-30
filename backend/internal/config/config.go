@@ -27,6 +27,7 @@ type Config struct {
 	LoginMaxFails     int
 	LoginWindow       time.Duration
 	SessionTTL        time.Duration
+	TrashRetention    time.Duration
 	AutoMigrate       bool
 }
 
@@ -48,6 +49,7 @@ func Load() (Config, error) {
 		LoginMaxFails:     envInt("LOGIN_LIMIT_MAX_FAILS", 5),
 		LoginWindow:       time.Duration(envInt("LOGIN_LIMIT_WINDOW_SECONDS", 600)) * time.Second,
 		SessionTTL:        time.Duration(envInt("SESSION_TTL_SECONDS", 12*60*60)) * time.Second,
+		TrashRetention:    time.Duration(envInt("TRASH_RETENTION_DAYS", 10)) * 24 * time.Hour,
 		AutoMigrate:       envBool("AUTO_MIGRATE", true),
 	}
 	c.MySQLDSN = mysqlDSN()
@@ -75,6 +77,9 @@ func (c Config) validate() error {
 	}
 	if c.SessionTTL < time.Minute {
 		return errors.New("SESSION_TTL_SECONDS must be at least 60")
+	}
+	if c.TrashRetention < 24*time.Hour || c.TrashRetention > 365*24*time.Hour {
+		return errors.New("TRASH_RETENTION_DAYS must be between 1 and 365")
 	}
 	return nil
 }

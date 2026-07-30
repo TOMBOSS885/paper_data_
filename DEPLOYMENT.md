@@ -74,6 +74,7 @@ openssl rand -base64 48
 | `API_PORT` | `8080` | API 监听端口，仅绑定 `127.0.0.1` 不对外暴露；与其他项目冲突时修改 |
 | `MYSQL_HOST` | `127.0.0.1` | MySQL 在本机时保持默认；在其他服务器时填其 IP |
 | `COOKIE_SECURE` | `false` | 通过 HTTPS 域名访问时改为 `true`；用 `http://IP` 访问时必须保持 `false`，否则浏览器不回传 Cookie、无法登录 |
+| `TRASH_RETENTION_DAYS` | `10` | 论文进入回收站后的保留天数，允许 1 至 365；旧 `.env` 不配置时自动使用 10 天 |
 | `GO_IMAGE` 等 | Docker Hub 官方镜像 | 国内服务器拉取超时时换成镜像加速地址，如 `镜像加速域名/library/golang:1.22-alpine` |
 | `AUTO_MIGRATE` | `true` | 启动时自动执行版本化数据库迁移（已应用的版本会跳过） |
 
@@ -123,12 +124,36 @@ docker run --rm -v paper-knowledge-base_paper_uploads:/data -v $(pwd):/backup al
   tar czf /backup/uploads_$(date +%F).tar.gz -C /data .              # 上传的论文文件
 ```
 
-## 六点五、怎么看日志（排查第一步）
+### 增量升级到回收站版本
 
-进入项目目录（服务器上是 `/home/www/paper_data_`）执行：
+此次升级不需要重建数据库、上传卷或管理员账号。升级前先备份 MySQL 和 `paper_uploads` 卷，然后执行：
 
 ```bash
-cd /home/www/paper_data_
+cd /www/wwwroot/paper_data_
+git pull --ff-only origin main
+
+# 007 迁移必须至少自动执行一次；旧 .env 没有 TRASH_RETENTION_DAYS 也会默认使用 10 天
+grep -E '^(AUTO_MIGRATE|TRASH_RETENTION_DAYS)=' .env || true
+docker compose --env-file .env -f deploy/docker-compose.yml config --quiet
+bash deploy.sh
+```
+
+保持 `AUTO_MIGRATE=true` 时，API 启动会自动应用 `007_trash_retention.sql`。迁移会让旧版本已经软删除的论文从升级时刻重新获得完整恢复期，并重算活动论文的标签/分类计数；不会修改正常论文和上传文件。部署后可在 MySQL 中验证：
+
+```sql
+SELECT version, applied_at
+FROM schema_migrations
+WHERE version = '007_trash_retention.sql';
+```
+
+迁移记录存在后，清理任务会在启动时运行一次，随后每小时清理到期项目。不要执行 `docker compose down -v`，否则会删除上传卷。
+
+## 六点五、怎么看日志（排查第一步）
+
+进入项目目录（服务器上是 `/www/wwwroot/paper_data_`）执行：
+
+```bash
+cd /www/wwwroot/paper_data_
 
 # 1. 先看两个容器是否都在 running
 docker compose --env-file .env -f deploy/docker-compose.yml ps

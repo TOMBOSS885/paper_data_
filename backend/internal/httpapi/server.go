@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,6 +112,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/papers/extract", s.extractPapers)
 	mux.HandleFunc("/api/papers", s.papers)
 	mux.HandleFunc("/api/papers/", s.paperByID)
+	mux.HandleFunc("/api/trash", s.trash)
+	mux.HandleFunc("/api/trash/", s.trashByID)
 
 	return s.withMiddleware(mux)
 }
@@ -441,10 +444,10 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		var row statsRow
 		err := s.db.QueryRowContext(ctx,
 			`SELECT
-			   SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END),
-			   SUM(CASE WHEN deleted_at IS NULL AND is_favorite=1 THEN 1 ELSE 0 END),
-			   SUM(CASE WHEN deleted_at IS NULL AND reading_status='unread' THEN 1 ELSE 0 END),
-			   SUM(CASE WHEN deleted_at IS NULL AND added_at >= UTC_TIMESTAMP(6) - INTERVAL 30 DAY THEN 1 ELSE 0 END)
+			   COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END),0),
+			   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND is_favorite=1 THEN 1 ELSE 0 END),0),
+			   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND reading_status='unread' THEN 1 ELSE 0 END),0),
+			   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND added_at >= UTC_TIMESTAMP(6) - INTERVAL 30 DAY THEN 1 ELSE 0 END),0)
 			 FROM papers`).Scan(&row.total, &row.favorites, &row.unread, &row.last30)
 		if err != nil {
 			errCh <- fmt.Errorf("dashboard stats: %w", err)
@@ -466,22 +469,22 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		recent := make([]map[string]any, 0, 5)
 		recentIDs := make([]string, 0, 5)
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 5`)
+			`SELECT id,title,LEFT(abstract_text,600),authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 5`)
 		if err != nil {
 			errCh <- fmt.Errorf("dashboard recent: %w", err)
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var id, title, authors, status, parse string
+			var id, title, abstract, authors, status, parse string
 			var doi, journal sql.NullString
 			var published sql.NullTime
 			var fav bool
 			var added, updated time.Time
-			if err := rows.Scan(&id, &title, &authors, &doi, &journal, &published, &status, &fav, &parse, &added, &updated); err != nil {
+			if err := rows.Scan(&id, &title, &abstract, &authors, &doi, &journal, &published, &status, &fav, &parse, &added, &updated); err != nil {
 				continue
 			}
-			recent = append(recent, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
+			recent = append(recent, paperSummary(id, title, abstract, authors, doi, journal, published, status, parse, fav, added, updated))
 			recentIDs = append(recentIDs, id)
 		}
 		recentCh <- recent
@@ -1237,24 +1240,12 @@ func (s *Server) bulkDelete(w http.ResponseWriter, r *http.Request) {
 	if !s.confirmAdminPassword(w, r, id, req.Password, fmt.Sprintf("bulk:delete:%d", id)) {
 		return
 	}
-	existing, missing, err := s.bulkTxOnPapers(r.Context(), paperIDs, func(tx *sql.Tx, ids []string) error {
-		ph := placeholders(len(ids))
-		args := make([]any, 0, len(ids))
-		args = append(args, time.Now().UTC())
-		for _, id := range ids {
-			args = append(args, id)
-		}
-		_, err := tx.ExecContext(r.Context(),
-			`UPDATE papers SET deleted_at=UTC_TIMESTAMP(6), updated_at=UTC_TIMESTAMP(6) WHERE id IN (`+ph+`) AND deleted_at IS NULL`,
-			args[1:]...)
-		return err
-	})
+	existing, missing, err := s.softDeletePapers(r.Context(), paperIDs, id, clientIP(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to delete papers")
 		return
 	}
-	// 顺手清理孤儿文件：上传目录里的 object_key 仍以 paper id 命名，物理删除留给运维（保留审计）。
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(existing), "missing": missing})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(existing), "missing": missing, "retentionDays": int(s.cfg.TrashRetention / (24 * time.Hour))})
 }
 
 // bulkFavorite 一组论文设置 isFavorite；二次校验需要管理员密码。
@@ -1402,8 +1393,8 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 		rows.Close()
 
 		// 差量计数：全局 add / remove 聚合
-		addTotal := make(map[uint64]struct{})
-		removeTotal := make(map[uint64]struct{})
+		addTotal := make(map[uint64]int)
+		removeTotal := make(map[uint64]int)
 
 		for _, pid := range ids {
 			oldSet := old[pid]
@@ -1437,17 +1428,17 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 			// 3) 算这篇的 add/remove
 			for xid := range seen {
 				if _, ok := oldSet[xid]; !ok {
-					addTotal[xid] = struct{}{}
+					addTotal[xid]++
 				}
 			}
 			for xid := range oldSet {
 				if _, ok := seen[xid]; !ok {
-					removeTotal[xid] = struct{}{}
+					removeTotal[xid]++
 				}
 			}
 		}
 
-		adjustCountDelta := func(m map[uint64]struct{}, delta int) error {
+		adjustCountDelta := func(m map[uint64]int, direction int) error {
 			if len(m) == 0 {
 				return nil
 			}
@@ -1455,14 +1446,19 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 			for x := range m {
 				ids = append(ids, x)
 			}
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 			ph := placeholders(len(ids))
-			args := make([]any, 0, len(ids)+1)
-			args = append(args, delta)
+			var cases strings.Builder
+			args := make([]any, 0, len(ids)*3)
+			for _, x := range ids {
+				cases.WriteString(" WHEN ? THEN ?")
+				args = append(args, x, direction*m[x])
+			}
 			for _, x := range ids {
 				args = append(args, x)
 			}
 			_, err := tx.ExecContext(r.Context(),
-				`UPDATE `+countTable+` SET `+countColumn+`=GREATEST(0, `+countColumn+`+?) WHERE id IN (`+ph+`)`,
+				`UPDATE `+countTable+` SET `+countColumn+`=GREATEST(0, CAST(`+countColumn+` AS SIGNED)+CASE id`+cases.String()+` ELSE 0 END) WHERE id IN (`+ph+`)`,
 				args...)
 			return err
 		}
@@ -1596,7 +1592,7 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	listArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE `+clause+` ORDER BY `+order+` LIMIT ? OFFSET ?`, listArgs...)
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id,title,LEFT(abstract_text,600),authors_json,doi,journal,published_at,reading_status,is_favorite,parse_status,added_at,updated_at FROM papers WHERE `+clause+` ORDER BY `+order+` LIMIT ? OFFSET ?`, listArgs...)
 	if err != nil {
 		writeError(w, 500, "internal_error", "unable to query papers")
 		return
@@ -1605,15 +1601,15 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0, pageSize)
 	ids := make([]string, 0, pageSize)
 	for rows.Next() {
-		var id, title, authors, status, parse string
+		var id, title, abstract, authors, status, parse string
 		var doi, journal sql.NullString
 		var published sql.NullTime
 		var fav bool
 		var added, updated time.Time
-		if err := rows.Scan(&id, &title, &authors, &doi, &journal, &published, &status, &fav, &parse, &added, &updated); err != nil {
+		if err := rows.Scan(&id, &title, &abstract, &authors, &doi, &journal, &published, &status, &fav, &parse, &added, &updated); err != nil {
 			continue
 		}
-		items = append(items, paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated))
+		items = append(items, paperSummary(id, title, abstract, authors, doi, journal, published, status, parse, fav, added, updated))
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
@@ -1642,7 +1638,7 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 }
 
 // paperSummary 统一列表与概览的论文字段，前端依赖 year 直接展示发表年份。
-func paperSummary(id, title, authors string, doi, journal sql.NullString, published sql.NullTime, status, parse string, fav bool, added, updated time.Time) map[string]any {
+func paperSummary(id, title, abstract, authors string, doi, journal sql.NullString, published sql.NullTime, status, parse string, fav bool, added, updated time.Time) map[string]any {
 	var authorList any
 	if err := json.Unmarshal([]byte(authors), &authorList); err != nil {
 		authorList = []any{}
@@ -1652,7 +1648,7 @@ func paperSummary(id, title, authors string, doi, journal sql.NullString, publis
 		year = published.Time.Year()
 	}
 	return map[string]any{
-		"id": id, "title": title, "authors": authorList, "doi": doi.String, "journal": journal.String,
+		"id": id, "title": title, "abstract": abstract, "authors": authorList, "doi": doi.String, "journal": journal.String,
 		"year": year, "readingStatus": status, "isFavorite": fav, "parseStatus": parse,
 		"addedAt": added, "updatedAt": updated, "tags": []any{}, "categories": []any{},
 	}
@@ -1963,7 +1959,7 @@ func (s *Server) getPaper(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, 404, "not_found", "paper not found")
 		return
 	}
-	item := paperSummary(id, title, authors, doi, journal, published, status, parse, fav, added, updated)
+	item := paperSummary(id, title, abstract, authors, doi, journal, published, status, parse, fav, added, updated)
 	item["abstract"] = abstract
 	item["version"] = version
 	tags, cats, terr := s.loadTaxonomy(r.Context(), []string{id})
@@ -2069,7 +2065,7 @@ func (s *Server) deletePaper(w http.ResponseWriter, r *http.Request, id string) 
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
 		return
 	}
-	// 单篇删除走密码再认证（不可逆操作，防误删 / 防 CSRF 以外的攻击）。
+	// 单篇删除仍走密码再认证，避免攻击者利用已解锁的浏览器会话批量移入回收站。
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -2079,16 +2075,16 @@ func (s *Server) deletePaper(w http.ResponseWriter, r *http.Request, id string) 
 	if !s.confirmAdminPassword(w, r, adminID, req.Password, fmt.Sprintf("paper:delete:%d", adminID)) {
 		return
 	}
-	res, err := s.db.ExecContext(r.Context(), `UPDATE papers SET deleted_at=UTC_TIMESTAMP(6),updated_at=UTC_TIMESTAMP(6) WHERE id=? AND deleted_at IS NULL`, id)
+	existing, _, err := s.softDeletePapers(r.Context(), []string{id}, adminID, clientIP(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to delete paper")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if len(existing) == 0 {
 		writeError(w, http.StatusNotFound, "not_found", "paper not found")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true, "retentionDays": int(s.cfg.TrashRetention / (24 * time.Hour))})
 }
 func (s *Server) fileResponse(w http.ResponseWriter, r *http.Request, id string) {
 	if _, ok := s.authenticate(r); !ok {

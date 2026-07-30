@@ -76,7 +76,7 @@ func (s *Server) reextractPaper(w http.ResponseWriter, r *http.Request, id strin
 	}
 
 	var fileKey string
-	err := s.db.QueryRowContext(r.Context(), `SELECT object_key FROM paper_files WHERE paper_id=? ORDER BY created_at DESC LIMIT 1`, id).Scan(&fileKey)
+	err := s.db.QueryRowContext(r.Context(), `SELECT f.object_key FROM paper_files f JOIN papers p ON p.id=f.paper_id AND p.deleted_at IS NULL WHERE f.paper_id=? ORDER BY f.created_at DESC LIMIT 1`, id).Scan(&fileKey)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeError(w, http.StatusNotFound, "not_found", "paper file not found")
@@ -86,7 +86,11 @@ func (s *Server) reextractPaper(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 
-	path := filepath.Join(s.cfg.UploadDir, fileKey)
+	path, err := safeObjectPath(s.cfg.UploadDir, fileKey)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "invalid stored paper file path")
+		return
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to read paper file")
@@ -125,10 +129,14 @@ func (s *Server) reextractPaper(w http.ResponseWriter, r *http.Request, id strin
 	params = append(params, time.Now().UTC())
 	params = append(params, id)
 
-	q := "UPDATE papers SET " + strings.Join(sets, ",") + " WHERE id=?"
-	_, err = s.db.ExecContext(r.Context(), q, params...)
+	q := "UPDATE papers SET " + strings.Join(sets, ",") + " WHERE id=? AND deleted_at IS NULL"
+	result, err := s.db.ExecContext(r.Context(), q, params...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update paper metadata")
+		return
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		writeError(w, http.StatusNotFound, "not_found", "paper not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, meta)

@@ -69,6 +69,7 @@ export type Category = {
 export type Paper = {
   id: string
   title: string
+  abstract?: string
   authors?: Author[] | null
   year?: number | null
   journal?: string
@@ -80,6 +81,10 @@ export type Paper = {
   updatedAt?: string
   tags?: Tag[]
   categories?: { id: number; name: string }[]
+}
+export type TrashPaper = Paper & {
+  deletedAt: string
+  purgeAt: string
 }
 export type PaperDetail = Paper & {
   abstract?: string
@@ -104,6 +109,10 @@ export const changePassword = (currentPassword: string, newPassword: string) =>
   api('/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) })
 
 export const papers = (params = '') => api<{ data: { items: Paper[]; total: number; page: number; pageSize: number } }>(`/papers${params}`)
+export const trashPapers = (params = '') =>
+  api<{ data: { items: TrashPaper[]; total: number; page: number; pageSize: number; retentionDays: number } }>(`/trash${params}`)
+export const restoreTrashPaper = (id: string) =>
+  api<{ data: { id: string; restored: boolean } }>(`/trash/${encodeURIComponent(id)}/restore`, { method: 'POST' })
 export const paper = (id: string) => api<{ data: PaperDetail }>(`/papers/${encodeURIComponent(id)}`)
 export const updatePaper = (id: string, payload: Record<string, unknown>) =>
   api<{ data: PaperDetail }>(`/papers/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) })

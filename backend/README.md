@@ -12,6 +12,8 @@ The server runs migrations when `AUTO_MIGRATE=true` (the development default). P
 
 Migration `006_drop_citation_formats.sql` removes the retired citation-format feature while preserving migration continuity for existing deployments.
 
+Migration `007_trash_retention.sql` gives previously deleted papers a fresh recovery window, rebuilds active taxonomy counters, and adds the indexed recycle-bin cleanup path. `TRASH_RETENTION_DAYS` defaults to `10` and accepts `1` through `365`; the cleanup worker remains disabled until migration `007` is recorded.
+
 The API uses `pkb_session` and `pkb_csrf` cookies. All authenticated state-changing requests require an `X-CSRF-Token` header matching the CSRF cookie.
 
 Set `SETUP_SECRET` to a separate random secret before first deployment. `GET /api/setup/status` intentionally returns only `initialized`; send this secret as `setupNonce` to `POST /api/setup/admin` through the protected setup interface.

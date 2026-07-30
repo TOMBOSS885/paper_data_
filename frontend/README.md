@@ -1,6 +1,6 @@
 # Paper Atlas 前端
 
-React 19 + Vite + TypeScript 的单管理员论文工作台。界面支持明暗主题、响应式侧栏和移动端筛选面板。会话由后端 HttpOnly Cookie 管理，前端不会把 token 写入 `localStorage` 或 `sessionStorage`。
+React 19 + Vite + TypeScript 的单管理员论文工作台。论文条目展示摘要、分类和标签，删除后可在回收站的保留期内恢复。界面支持明暗主题、响应式侧栏和移动端筛选面板。会话由后端 HttpOnly Cookie 管理，前端不会把 token 写入 `localStorage` 或 `sessionStorage`。
 
 ## 本地开发
 

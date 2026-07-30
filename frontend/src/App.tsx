@@ -2,7 +2,7 @@ import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, LayoutDashboard, LogOut, Menu, Moon, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, Upload, X } from 'lucide-react'
+import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, LayoutDashboard, LogOut, Menu, Moon, RotateCcw, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, Upload, X } from 'lucide-react'
 import {
   ApiError,
   bulkDeletePapers,
@@ -28,13 +28,15 @@ import {
   paper as fetchPaper,
   papers as fetchPapers,
   reextractPaper,
+  restoreTrashPaper,
   setupStatus,
+  trashPapers,
   updatePaper,
   updatePaperCategories,
   updatePaperTags,
   uploadPapers,
 } from './lib/api'
-import type { Category, Paper, PaperDetail, Tag, UploadResult } from './lib/api'
+import type { Category, Paper, PaperDetail, Tag, TrashPaper, UploadResult } from './lib/api'
 import { extractPapersPreview } from './lib/api'
 
 // 标签颜色映射：与 styles.css 中 .tag.<color> 的类名一致。
@@ -136,6 +138,7 @@ export function Shell({ children }: { children: ReactNode }) {
     { to: '/app/papers', label: '论文库', icon: BookOpen },
     { to: '/app/import', label: '导入论文', icon: Upload },
     { to: '/app/taxonomy', label: '分类与标签', icon: Tags },
+    { to: '/app/trash', label: '回收站', icon: Trash2 },
     { to: '/app/settings/security', label: '安全设置', icon: Settings2 },
   ]
 
@@ -397,17 +400,24 @@ const PaperRow = memo(function PaperRow({ paper, selectable, selected, onToggle 
       <div className="paper-icon"><BookOpen size={18} /></div>
       <div className="paper-main">
         <strong>{paper.isFavorite ? '★ ' : ''}{paper.title}</strong>
-        <span>{authorLine(paper)}{paper.journal ? ` · ${paper.journal}` : ''}</span>
-        {(tags.length > 0 || cats.length > 0) && (
-          <span className="row-taxonomy">
-            {cats.map((c) => (
+        <span className="paper-byline">{authorLine(paper)}{paper.journal ? ` · ${paper.journal}` : ''}</span>
+        <p className={paper.abstract?.trim() ? 'paper-abstract' : 'paper-abstract empty-copy'}>
+          {paper.abstract?.trim() || '暂无摘要，可进入详情页补充论文概览。'}
+        </p>
+        <div className="row-taxonomy" aria-label="论文分类与标签">
+          <div className="taxonomy-group">
+            <span className="taxonomy-label">分类</span>
+            {cats.length > 0 ? cats.map((c) => (
               <button type="button" className="taxonomy-chip cat" key={`c-${c.id}`} onClick={(e) => { stop(e); nav(`/app/papers?category=${c.id}`) }}>{c.name}</button>
-            ))}
-            {tags.map((t) => (
+            )) : <span className="taxonomy-empty">未分类</span>}
+          </div>
+          <div className="taxonomy-group">
+            <span className="taxonomy-label">标签</span>
+            {tags.length > 0 ? tags.map((t) => (
               <button type="button" className={`taxonomy-chip tag tag-${t.color}`} key={`t-${t.id}`} onClick={(e) => { stop(e); nav(`/app/papers?tag=${t.id}`) }}>#{t.name}</button>
-            ))}
-          </span>
-        )}
+            )) : <span className="taxonomy-empty">无标签</span>}
+          </div>
+        </div>
       </div>
       <span className="row-status">{statusLabel(paper.readingStatus)}</span>
     </div>
@@ -425,7 +435,7 @@ function Empty({ title, description, action }: { title: string; description: str
   )
 }
 
-// 通用密码确认 modal：用于批量删除 / 批量打标 / 单篇删除等不可逆操作。
+// 通用密码确认 modal：用于批量删除、批量打标和单篇删除等敏感操作。
 // 受控 open / busy，提交时调用 onConfirm(password)。
 function PasswordModal({
   open, title, description, confirmLabel = '确认', busy, onConfirm, onCancel,
@@ -745,7 +755,7 @@ function Papers() {
           <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'favorite-off' })}><Star size={15} />批量取消收藏</button>
           <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'tags' })}><TagIcon size={15} />批量打标签</button>
           <button type="button" className="button secondary" onClick={() => setBulkState({ kind: 'categories' })}><FolderPlus size={15} />批量分类</button>
-          <button type="button" className="button danger" onClick={() => setBulkState({ kind: 'delete' })}><Trash2 size={15} />批量删除</button>
+          <button type="button" className="button danger" onClick={() => setBulkState({ kind: 'delete' })}><Trash2 size={15} />移入回收站</button>
         </div>
       )}
       <div className="toolbar">
@@ -872,12 +882,12 @@ function Papers() {
         <PasswordModal
           open
           title={
-            bulkState.kind === 'delete' ? `批量删除 ${selectedCount} 篇`
+            bulkState.kind === 'delete' ? `将 ${selectedCount} 篇论文移入回收站`
               : bulkState.kind === 'favorite-on' ? `批量加收藏（${selectedCount} 篇）`
               : `批量取消收藏（${selectedCount} 篇）`
           }
-          description="这是不可逆操作，请输入当前管理员密码以确认。"
-          confirmLabel="确认执行"
+          description={bulkState.kind === 'delete' ? '论文将移入回收站，保留期内可以恢复；到期后服务器会永久删除论文文件。请输入当前管理员密码以确认。' : '请输入当前管理员密码以确认。'}
+          confirmLabel={bulkState.kind === 'delete' ? '确认移入回收站' : '确认执行'}
           busy={bulkBusy}
           onConfirm={(password) => runBulk(bulkState.kind, password)}
           onCancel={() => { setBulkState(null); setBatchError('') }}
@@ -894,6 +904,139 @@ function Papers() {
           onCancel={() => setBulkState(null)}
         />
       )}
+    </Shell>
+  )
+}
+
+const remainingLabel = (purgeAt: string) => {
+  const expires = new Date(purgeAt).getTime()
+  if (!Number.isFinite(expires)) return '清理时间待确认'
+  const remaining = Math.ceil((expires - Date.now()) / 86400000)
+  if (remaining <= 0) return '等待永久清理'
+  if (remaining === 1) return '不足 1 天后清理'
+  return `剩余 ${remaining} 天`
+}
+
+const TrashPaperRow = memo(function TrashPaperRow({ paper, busy, onRestore }: { paper: TrashPaper; busy: boolean; onRestore: (id: string) => void }) {
+  const tags = paper.tags ?? []
+  const cats = paper.categories ?? []
+  return (
+    <article className="paper-row trash-row">
+      <div className="paper-icon trash-icon"><Trash2 size={18} /></div>
+      <div className="paper-main">
+        <strong>{paper.title}</strong>
+        <span className="paper-byline">{authorLine(paper)}{paper.journal ? ` · ${paper.journal}` : ''}</span>
+        <p className={paper.abstract?.trim() ? 'paper-abstract' : 'paper-abstract empty-copy'}>
+          {paper.abstract?.trim() || '暂无摘要。'}
+        </p>
+        <div className="row-taxonomy" aria-label="论文分类与标签">
+          <div className="taxonomy-group">
+            <span className="taxonomy-label">分类</span>
+            {cats.length > 0
+              ? cats.map((category) => <span className="taxonomy-chip cat" key={`c-${category.id}`}>{category.name}</span>)
+              : <span className="taxonomy-empty">未分类</span>}
+          </div>
+          <div className="taxonomy-group">
+            <span className="taxonomy-label">标签</span>
+            {tags.length > 0
+              ? tags.map((tag) => <span className={`taxonomy-chip tag tag-${tag.color}`} key={`t-${tag.id}`}>#{tag.name}</span>)
+              : <span className="taxonomy-empty">无标签</span>}
+          </div>
+        </div>
+      </div>
+      <div className="trash-actions">
+        <span className="trash-deadline" title={`预计永久删除：${new Date(paper.purgeAt).toLocaleString()}`}>
+          <Clock3 size={14} />{remainingLabel(paper.purgeAt)}
+        </span>
+        <button type="button" className="button secondary" disabled={busy} onClick={() => onRestore(paper.id)}>
+          <RotateCcw size={15} />{busy ? '恢复中…' : '恢复'}
+        </button>
+      </div>
+    </article>
+  )
+})
+
+function Trash() {
+  const [items, setItems] = useState<TrashPaper[]>([])
+  const [total, setTotal] = useState(0)
+  const [retentionDays, setRetentionDays] = useState(10)
+  const [page, setPage] = useState(1)
+  const [loading, setLoading] = useState(true)
+  const [restoringID, setRestoringID] = useState('')
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const query = `?page=${page}&pageSize=${PAGE_SIZE}`
+      const response = await trashPapers(query)
+      setItems(response.data.items ?? [])
+      setTotal(response.data.total ?? 0)
+      setRetentionDays(response.data.retentionDays ?? 10)
+    } catch (e) {
+      setError(errorMessage(e))
+      setItems([])
+    } finally {
+      setLoading(false)
+    }
+  }, [page])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const restore = useCallback(async (id: string) => {
+    if (restoringID) return
+    setRestoringID(id)
+    setError('')
+    setNotice('')
+    try {
+      await restoreTrashPaper(id)
+      setNotice('论文已恢复，可在论文库中继续查看和编辑。')
+      if (items.length === 1 && page > 1) setPage((value) => value - 1)
+      else await load()
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setRestoringID('')
+    }
+  }, [items.length, load, page, restoringID])
+
+  const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  return (
+    <Shell>
+      <div className="page-head">
+        <div>
+          <p className="eyebrow">文件保护</p>
+          <h1>回收站</h1>
+          <p className="muted">共 {total} 篇。删除的论文保留 {retentionDays} 天，到期后服务器会自动永久删除对应文件。</p>
+        </div>
+        <Link className="button secondary" to="/app/papers"><BookOpen size={16} />返回论文库</Link>
+      </div>
+      {error && <div className="alert error" role="alert">{error}</div>}
+      {notice && <div className="alert ok" role="status">{notice}</div>}
+      <div className="panel trash-list">
+        {loading ? (
+          <div className="loading">正在读取回收站…</div>
+        ) : items.length === 0 ? (
+          <Empty title="回收站是空的" description="移入回收站的论文会在这里保留，期间可以随时恢复。" />
+        ) : (
+          <>
+            {items.map((paper) => (
+              <TrashPaperRow key={paper.id} paper={paper} busy={restoringID === paper.id} onRestore={restore} />
+            ))}
+            {lastPage > 1 && (
+              <div className="pager">
+                <button className="button secondary" disabled={page <= 1 || loading} onClick={() => setPage((value) => value - 1)}>上一页</button>
+                <span>{page} / {lastPage}</span>
+                <button className="button secondary" disabled={page >= lastPage || loading} onClick={() => setPage((value) => value + 1)}>下一页</button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </Shell>
   )
 }
@@ -1090,7 +1233,7 @@ function PaperDetailPage() {
                 setBusy(false);
               }
             }}><BookOpen size={16} />重新识别</button>
-            <button className="button secondary" disabled={busy} onClick={() => setDeleteOpen(true)}><Trash2 size={16} />删除论文</button>
+            <button className="button secondary" disabled={busy} onClick={() => setDeleteOpen(true)}><Trash2 size={16} />移入回收站</button>
           </div>
           <div className="taxonomy-editor">
             <h3>分类</h3>
@@ -1142,9 +1285,9 @@ function PaperDetailPage() {
       </div>
       <PasswordModal
         open={deleteOpen}
-        title="删除这篇论文"
-        description="这是不可逆操作。删除后不会出现在列表中。请输入当前管理员密码以确认。"
-        confirmLabel="确认删除"
+        title="将这篇论文移入回收站"
+        description="移入后在回收站保留期内可以恢复；到期未恢复时，服务器会永久删除论文文件。请输入当前管理员密码以确认。"
+        confirmLabel="确认移入回收站"
         busy={busy}
         onConfirm={destroyWithPassword}
         onCancel={() => setDeleteOpen(false)}
@@ -1590,6 +1733,7 @@ export default function App() {
         <Route path="/app/dashboard" element={guard(<Dashboard />)} />
         <Route path="/app/papers" element={guard(<Papers />)} />
         <Route path="/app/papers/:id" element={guard(<PaperDetailPage />)} />
+        <Route path="/app/trash" element={guard(<Trash />)} />
         <Route path="/app/import" element={guard(<Import />)} />
         <Route path="/app/taxonomy" element={guard(<Taxonomy />)} />
         <Route path="/app/settings/security" element={guard(<Security />)} />
