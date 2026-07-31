@@ -50,3 +50,18 @@ func TestWithNoStoreHeaders(t *testing.T) {
 		t.Fatalf("Vary = %q", got)
 	}
 }
+
+func TestCORSPreflightAllowsPut(t *testing.T) {
+	server := &Server{}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodOptions, "/api/papers/1/tags", nil)
+
+	server.withMiddleware(http.NotFoundHandler()).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if got := recorder.Header().Get("Access-Control-Allow-Methods"); got != "GET,POST,PUT,PATCH,DELETE,OPTIONS" {
+		t.Fatalf("Access-Control-Allow-Methods = %q", got)
+	}
+}

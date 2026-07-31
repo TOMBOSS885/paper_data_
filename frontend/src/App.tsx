@@ -1,9 +1,9 @@
 import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, LayoutDashboard, LogOut, Menu, Moon, RotateCcw, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, Upload, X } from 'lucide-react'
+import { AlertCircle, ArrowLeft, BookOpen, CheckCircle2, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, Info, LayoutDashboard, LogOut, Menu, Moon, RotateCcw, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, TriangleAlert, Upload, X } from 'lucide-react'
 import {
   ApiError,
   bulkDeletePapers,
@@ -68,10 +68,10 @@ const authorLine = (p: Paper) => {
 type ThemeMode = 'light' | 'dark'
 
 function initialTheme(): ThemeMode {
-  if (typeof window === 'undefined') return 'light'
+  if (typeof window === 'undefined') return 'dark'
   const stored = window.localStorage.getItem('paper-atlas-theme')
   if (stored === 'light' || stored === 'dark') return stored
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  return 'dark'
 }
 
 function ThemeToggle({ compact = false }: { compact?: boolean }) {
@@ -186,19 +186,20 @@ export function Shell({ children }: { children: ReactNode }) {
       <div className="main-area">
         <header className="topbar">
           <button className="icon-button mobile-menu" onClick={() => setOpen(true)} aria-label="打开导航"><Menu size={20} /></button>
-          <div className="global-search">
-            <Search size={17} />
+          <div className="global-search search-inputbox">
+            <Search className="search-leading-icon" size={17} />
             <input
               ref={searchRef}
               aria-label="搜索论文"
-              placeholder="搜索标题、作者、DOI…"
+              placeholder=" "
               onKeyDown={(e) => {
                 if (e.key !== 'Enter') return
                 const value = e.currentTarget.value.trim()
                 nav(value ? `/app/papers?q=${encodeURIComponent(value)}` : '/app/papers')
               }}
             />
-            <kbd>⌘ K</kbd>
+            <span className="search-label">搜索标题、作者、DOI…</span>
+            <span className="search-fill" aria-hidden="true" />
           </div>
           <div className="top-actions"><ThemeToggle compact /><span className="avatar">A</span></div>
         </header>
@@ -242,7 +243,7 @@ function Setup() {
         <p className="eyebrow">首次部署</p>
         <h1>创建管理员</h1>
         <p className="muted">初始化只执行一次。请输入部署时设置的初始化令牌。</p>
-        {error && <div className="alert error">{error}</div>}
+        <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
         <label>初始化令牌<input type="password" value={setupSecret} onChange={(e) => setSetupSecret(e.target.value)} placeholder="SETUP_SECRET" autoComplete="one-time-code" /></label>
         <label>管理员邮箱<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" /></label>
         <label>显示名称<input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：林研究员" /></label>
@@ -281,7 +282,7 @@ function Login() {
         <p className="eyebrow">管理员入口</p>
         <h1>欢迎回来</h1>
         <p className="muted">你的论文、笔记和研究脉络都在这里。</p>
-        {error && <div className="alert error">{error}</div>}
+        <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
         <form
           onSubmit={(e) => {
             e.preventDefault()
@@ -333,7 +334,7 @@ function Dashboard() {
         </div>
         <Link className="button primary" to="/app/import"><Upload size={17} />导入论文</Link>
       </div>
-      {error && <div className="alert error">{error}</div>}
+      <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
       <section className="stat-grid">
         {stats.map(({ label, value, unit, icon: Icon, tone }) => (
           <div className={`stat-card tone-${tone}`} key={label}>
@@ -437,6 +438,163 @@ function Empty({ title, description, action }: { title: string; description: str
   )
 }
 
+type NoticeVariant = 'error' | 'success' | 'info' | 'warning'
+const activeNoticeIds: symbol[] = []
+const noticeStackSubscribers = new Set<() => void>()
+
+function syncNoticeStack() {
+  noticeStackSubscribers.forEach((subscriber) => subscriber())
+}
+
+function NoticeModal({
+  open,
+  variant = 'info',
+  title,
+  message,
+  onClose,
+}: {
+  open: boolean
+  variant?: NoticeVariant
+  title?: string
+  message: string
+  onClose: () => void
+}) {
+  const onCloseRef = useRef(onClose)
+  const noticeId = useRef(Symbol('notice'))
+  const [stackIndex, setStackIndex] = useState(0)
+
+  useEffect(() => {
+    onCloseRef.current = onClose
+  }, [onClose])
+
+  useEffect(() => {
+    if (!open) return
+    const id = noticeId.current
+    const syncIndex = () => setStackIndex(Math.max(0, activeNoticeIds.indexOf(id)))
+    if (!activeNoticeIds.includes(id)) activeNoticeIds.push(id)
+    noticeStackSubscribers.add(syncIndex)
+    syncNoticeStack()
+    return () => {
+      const index = activeNoticeIds.indexOf(id)
+      if (index >= 0) activeNoticeIds.splice(index, 1)
+      noticeStackSubscribers.delete(syncIndex)
+      syncNoticeStack()
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const closeTimer = window.setTimeout(() => onCloseRef.current(), 4200)
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCloseRef.current()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.clearTimeout(closeTimer)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  if (!open) return null
+
+  const Icon = variant === 'error' ? AlertCircle : variant === 'success' ? CheckCircle2 : variant === 'warning' ? TriangleAlert : Info
+  const fallbackTitle = variant === 'error' ? '操作失败' : variant === 'success' ? '操作完成' : variant === 'warning' ? '请确认' : '提示'
+
+  return (
+    <div
+      className={`notice-toast notice-${variant}`}
+      role={variant === 'error' ? 'alert' : 'status'}
+      aria-live={variant === 'error' ? 'assertive' : 'polite'}
+      style={{ '--notice-offset': `${stackIndex * 118}px` } as CSSProperties}
+    >
+      <div className="notice-icon"><Icon size={21} /></div>
+      <div className="notice-copy">
+        <h2>{title ?? fallbackTitle}</h2>
+        <p>{message}</p>
+      </div>
+      <button type="button" className="icon-button notice-close" aria-label="关闭提示" onClick={onClose}><X size={15} /></button>
+      <span className="notice-progress" />
+    </div>
+  )
+}
+
+function LoadingView({ text = '加载中…' }: { text?: string }) {
+  return (
+    <div className="loading" role="status" aria-live="polite">
+      <div className="wifi-loader" aria-hidden="true">
+        <svg className="circle-outer" viewBox="0 0 86 86">
+          <circle className="back" cx="43" cy="43" r="40" />
+          <circle className="front" cx="43" cy="43" r="40" />
+          <circle className="new" cx="43" cy="43" r="40" />
+        </svg>
+        <svg className="circle-middle" viewBox="0 0 60 60">
+          <circle className="back" cx="30" cy="30" r="27" />
+          <circle className="front" cx="30" cy="30" r="27" />
+        </svg>
+        <svg className="circle-inner" viewBox="0 0 34 34">
+          <circle className="back" cx="17" cy="17" r="14" />
+          <circle className="front" cx="17" cy="17" r="14" />
+        </svg>
+        <span className="wifi-dot" />
+      </div>
+      <span className="loading-text" data-text={text}>{text}</span>
+    </div>
+  )
+}
+
+function ConfirmModal({
+  open,
+  title,
+  description,
+  confirmLabel = '确认',
+  danger = false,
+  busy = false,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean
+  title: string
+  description: string
+  confirmLabel?: string
+  danger?: boolean
+  busy?: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const timer = setTimeout(() => cancelRef.current?.focus(), 30)
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) onCancel()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      clearTimeout(timer)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open, busy, onCancel])
+
+  if (!open) return null
+
+  return (
+    <div className="modal-mask" onClick={busy ? undefined : onCancel}>
+      <div className={`modal-panel confirm-panel${danger ? ' danger' : ''}`} role="alertdialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <div className="notice-icon"><TriangleAlert size={22} /></div>
+        <div className="notice-copy">
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+        <div className="modal-actions notice-actions">
+          <button ref={cancelRef} type="button" className="button secondary" onClick={onCancel} disabled={busy}>取消</button>
+          <button type="button" className={danger ? 'button danger' : 'button primary'} onClick={onConfirm} disabled={busy}>{busy ? '处理中…' : confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // 通用密码确认 modal：用于批量删除、批量打标和单篇删除等敏感操作。
 // 受控 open / busy，提交时调用 onConfirm(password)。
 function PasswordModal({
@@ -486,7 +644,7 @@ function PasswordModal({
       <div className="modal-panel" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
         <h2>{title}</h2>
         <p className="muted">{description}</p>
-        {err && <div className="alert error">{err}</div>}
+        {err && <p className="modal-note error">{err}</p>}
         <label className="field">当前管理员密码
           <input
             ref={inputRef}
@@ -761,10 +919,12 @@ function Papers() {
         </div>
       )}
       <div className="toolbar">
-        <div className="search-field">
-          <Search size={17} />
-          <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="搜索标题、作者、DOI、期刊…" />
+        <div className="search-field search-inputbox">
+          <Search className="search-leading-icon" size={17} />
+          <input aria-label="搜索论文库" value={draft} onChange={(e) => setDraft(e.target.value)} placeholder=" " />
+          <span className="search-label">搜索标题、作者、DOI、期刊…</span>
           {draft && <button className="icon-button" aria-label="清空搜索" onClick={() => setDraft('')}><X size={15} /></button>}
+          <span className="search-fill" aria-hidden="true" />
         </div>
         <button type="button" className={filtered ? 'button secondary filter-toggle active' : 'button secondary filter-toggle'} onClick={() => setFiltersOpen((value) => !value)} aria-expanded={filtersOpen}>
           <Filter size={16} />筛选{filtered ? ' · 已启用' : ''}
@@ -818,8 +978,8 @@ function Papers() {
           <div className="filter-note">筛选条件会写入网址，可直接收藏或分享该链接。</div>
         </aside>
         <div className="panel paper-list">
-          {batchErr && <div className="alert error">{batchErr}</div>}
-          {batchNotice && <div className="alert ok">{batchNotice}</div>}
+          <NoticeModal open={Boolean(batchErr)} variant="error" message={batchErr} onClose={() => setBatchError('')} />
+          <NoticeModal open={Boolean(batchNotice)} variant="success" message={batchNotice} onClose={() => setBatchError('')} />
           {!loading && items.length > 0 && (
             <div className="select-all">
               <label className="check-row">
@@ -833,9 +993,9 @@ function Papers() {
               <small className="muted">单次批量最多 100 篇</small>
             </div>
           )}
-          {error && <div className="alert error">{error}</div>}
+          <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
           {loading ? (
-            <div className="loading">正在查询论文…</div>
+            <LoadingView text="正在查询论文…" />
           ) : items.length === 0 ? (
             <Empty
               title={filtered ? '没有匹配的论文' : '论文库还是空的'}
@@ -1017,11 +1177,11 @@ function Trash() {
         </div>
         <Link className="button secondary" to="/app/papers"><BookOpen size={16} />返回论文库</Link>
       </div>
-      {error && <div className="alert error" role="alert">{error}</div>}
-      {notice && <div className="alert ok" role="status">{notice}</div>}
+      <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
+      <NoticeModal open={Boolean(notice)} variant="success" message={notice} onClose={() => setNotice('')} />
       <div className="panel trash-list">
         {loading ? (
-          <div className="loading">正在读取回收站…</div>
+          <LoadingView text="正在读取回收站…" />
         ) : items.length === 0 ? (
           <Empty title="回收站是空的" description="移入回收站的论文会在这里保留，期间可以随时恢复。" />
         ) : (
@@ -1056,6 +1216,7 @@ function PaperDetailPage() {
   const { data: allCategories = [] } = useCategories()
   const [selectedTagIDs, setSelectedTagIDs] = useState<number[]>([])
   const [selectedCategoryIDs, setSelectedCategoryIDs] = useState<number[]>([])
+  const [missingDismissed, setMissingDismissed] = useState(false)
 
   const apply = (detail: PaperDetail) => {
     setData(detail)
@@ -1158,11 +1319,11 @@ function PaperDetailPage() {
     }
   }
 
-  if (loading) return <Shell><div className="loading">正在加载论文…</div></Shell>
+  if (loading) return <Shell><LoadingView text="正在加载论文…" /></Shell>
   if (!data) {
     return (
       <Shell>
-        <div className="alert error">{error || '论文不存在'}</div>
+        <NoticeModal open={!missingDismissed} variant="error" message={error || '论文不存在'} onClose={() => { setError(''); setMissingDismissed(true) }} />
         <Link className="button secondary" to="/app/papers"><ArrowLeft size={16} />返回论文库</Link>
       </Shell>
     )
@@ -1184,8 +1345,8 @@ function PaperDetailPage() {
           {data.file && <a className="button secondary" href={fileUrl(id, 'download')}><Download size={16} />下载</a>}
         </div>
       </div>
-      {error && <div className="alert error">{error}</div>}
-      {notice && <div className="alert ok">{notice}</div>}
+      <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
+      <NoticeModal open={Boolean(notice)} variant="success" message={notice} onClose={() => setNotice('')} />
       <div className="content-grid">
         <div className="panel">
           <div className="panel-head"><h2>元数据</h2></div>
@@ -1375,7 +1536,7 @@ function Import() {
           <span>服务端会校验扩展名、大小和 PDF 文件头。</span>
           <input ref={inputRef} type="file" multiple accept={ALLOWED_EXTENSIONS.join(',')} onChange={(e) => pick(e.target.files)} />
         </label>
-        {error && <div className="alert error">{error}</div>}
+        <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
         {files.length > 0 && (
           <div className="file-list">
             {files.map((f) => (
@@ -1389,7 +1550,7 @@ function Import() {
           <button className="button primary" disabled={!files.length || busy || previewing} onClick={submit}><Upload size={17} />{busy ? '正在上传…' : '开始导入'}</button>
           {files.length > 0 && !busy && !previewing && <button className="button secondary" onClick={preview}>试识别</button>}
           {files.length > 0 && !busy && !previewing && <button className="button secondary" onClick={() => { setFiles([]); setPreviewResults([]); if (inputRef.current) inputRef.current.value = '' }}>清空</button>}
-          {notice && <span className="success-text">{notice}</span>}
+          <NoticeModal open={Boolean(notice)} variant="success" message={notice} onClose={() => setNotice('')} />
           {results.length > 0 && <Link to="/app/papers">前往论文库 →</Link>}
         </div>
         {previewResults.length > 0 && (
@@ -1437,6 +1598,8 @@ function Taxonomy() {
   const [newCat, setNewCat] = useState({ name: '', parentId: '' as string })
   const [busy, setBusy] = useState(false)
   const [expanded, setExpanded] = useState<Record<number, boolean>>({})
+  const [pendingDelete, setPendingDelete] = useState<null | { kind: 'category' | 'tag'; id: number; name: string }>(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
 
   const reload = useCallback(async () => {
     const [t, c] = await Promise.all([refetchTags(), refetchCategories()])
@@ -1498,22 +1661,39 @@ function Taxonomy() {
     }
   }
 
-  const renderCategoryNode = (c: Category, depth = 0): ReactNode => {
-    const isOpen = expanded[c.id] ?? true
-    const remove = async (e: React.MouseEvent) => {
-      e.preventDefault()
-      e.stopPropagation()
-      if (!window.confirm(`删除分类「${c.name}」？会同时移除其子分类与已关联论文的绑定。`)) return
-      try {
-        await deleteCategory(c.id)
-        queryClient.setQueryData<Category[]>(['categories'], (current) => removeCategoryFromTree(current ?? [], c.id))
+  const confirmDeleteTaxonomy = async () => {
+    if (!pendingDelete) return
+    setDeleteBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      if (pendingDelete.kind === 'category') {
+        await deleteCategory(pendingDelete.id)
+        queryClient.setQueryData<Category[]>(['categories'], (current) => removeCategoryFromTree(current ?? [], pendingDelete.id))
         const refresh = await refetchCategories()
         if (refresh.error) console.warn('刷新分类失败', refresh.error)
-        setError('')
-        setNotice(`已删除分类：${c.name}`)
-      } catch (e) {
-        setError(errorMessage(e))
+        setNotice(`已删除分类：${pendingDelete.name}`)
+      } else {
+        await deleteTag(pendingDelete.id)
+        queryClient.setQueryData<Tag[]>(['tags'], (current) => (current ?? []).filter((item) => item.id !== pendingDelete.id))
+        const refresh = await refetchTags()
+        if (refresh.error) console.warn('刷新标签失败', refresh.error)
+        setNotice(`已删除标签：${pendingDelete.name}`)
       }
+      setPendingDelete(null)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setDeleteBusy(false)
+    }
+  }
+
+  const renderCategoryNode = (c: Category, depth = 0): ReactNode => {
+    const isOpen = expanded[c.id] ?? true
+    const remove = (e: React.MouseEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setPendingDelete({ kind: 'category', id: c.id, name: c.name })
     }
     return (
       <div key={c.id} className="cat-node" style={{ paddingLeft: depth * 14 }}>
@@ -1539,8 +1719,8 @@ function Taxonomy() {
           <p className="muted">分类用于分层组织论文，标签用于横向标注主题。删除分类会同时移除其子分类与对应论文关联。</p>
         </div>
       </div>
-      {error && <div className="alert error">{error}</div>}
-      {notice && <div className="alert ok">{notice}</div>}
+      <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
+      <NoticeModal open={Boolean(notice)} variant="success" message={notice} onClose={() => setNotice('')} />
       <div className="tab-bar">
         <button className={tab === 'categories' ? 'tab active' : 'tab'} onClick={() => { setTab('categories'); setError(''); setNotice('') }}>分类树</button>
         <button className={tab === 'tags' ? 'tab active' : 'tab'} onClick={() => { setTab('tags'); setError(''); setNotice('') }}>标签</button>
@@ -1595,17 +1775,7 @@ function Taxonomy() {
                       onClick={async (e) => {
                         e.preventDefault()
                         e.stopPropagation()
-                        if (!window.confirm(`删除标签「${t.name}」？所有论文的该标签关联都会被移除。`)) return
-                        try {
-                          await deleteTag(t.id)
-                          queryClient.setQueryData<Tag[]>(['tags'], (current) => (current ?? []).filter((item) => item.id !== t.id))
-                          const refresh = await refetchTags()
-                          if (refresh.error) console.warn('刷新标签失败', refresh.error)
-                          setError('')
-                          setNotice(`已删除标签：${t.name}`)
-                        } catch (err) {
-                          setError(errorMessage(err))
-                        }
+                        setPendingDelete({ kind: 'tag', id: t.id, name: t.name })
                       }}
                     >
                       <X size={11} />
@@ -1626,6 +1796,16 @@ function Taxonomy() {
           </div>
         </div>
       )}
+      <ConfirmModal
+        open={Boolean(pendingDelete)}
+        title={pendingDelete?.kind === 'category' ? `删除分类「${pendingDelete.name}」` : `删除标签「${pendingDelete?.name ?? ''}」`}
+        description={pendingDelete?.kind === 'category' ? '会同时移除其子分类与已关联论文的绑定。此操作不可直接撤销。' : '所有论文的该标签关联都会被移除。此操作不可直接撤销。'}
+        confirmLabel="确认删除"
+        danger
+        busy={deleteBusy}
+        onConfirm={confirmDeleteTaxonomy}
+        onCancel={() => setPendingDelete(null)}
+      />
     </Shell>
   )
 }
@@ -1676,8 +1856,8 @@ function Security() {
       <div className="content-grid">
         <div className="panel">
           <div className="panel-head"><h2>修改密码</h2></div>
-          {error && <div className="alert error">{error}</div>}
-          {notice && <div className="alert ok">{notice}</div>}
+          <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
+          <NoticeModal open={Boolean(notice)} variant="success" message={notice} onClose={() => setNotice('')} />
           <form
             onSubmit={(e) => {
               e.preventDefault()
@@ -1706,6 +1886,202 @@ function Security() {
   )
 }
 
+function PreviewDashboard() {
+  const [notice, setNotice] = useState<{ variant: NoticeVariant; message: string } | null>(null)
+  const stats = [
+    { label: '论文总数', value: '1,284', unit: '篇', icon: BookOpen, tone: 'blue' },
+    { label: '近 30 天导入', value: '76', unit: '篇', icon: TrendingUp, tone: 'green' },
+    { label: '待阅读', value: '18', unit: '篇', icon: Clock3, tone: 'amber' },
+    { label: '存储占用', value: '3.42', unit: 'GB', icon: Database, tone: 'rose' },
+  ]
+
+  return (
+    <div className="preview-mode">
+      <Shell>
+        <div className="page-head">
+          <div>
+            <p className="eyebrow">研究工作台</p>
+            <h1>概览</h1>
+            <p className="muted">快速了解知识库的积累与下一步阅读。</p>
+          </div>
+          <button className="button primary" type="button" onClick={() => setNotice({ variant: 'success', message: '预览模式：导入入口工作正常。' })}><Upload size={17} />导入论文</button>
+        </div>
+
+        <section className="stat-grid">
+          {stats.map(({ label, value, unit, icon: Icon, tone }) => (
+            <div className={`stat-card tone-${tone}`} key={label}>
+              <div className="stat-card-head"><span>{label}</span><span className="stat-icon"><Icon size={19} /></span></div>
+              <div><strong>{value}</strong><small>{unit}</small></div>
+            </div>
+          ))}
+        </section>
+
+        <section className="dashboard-banner">
+          <div className="dashboard-banner-icon"><TrendingUp size={22} /></div>
+          <div><h2>继续构建你的研究脉络</h2><p>集中整理新论文，再通过阅读状态、分类和标签保持资料库可检索。</p></div>
+          <div className="dashboard-banner-actions">
+            <a href="#import" onClick={(event) => event.preventDefault()}>导入论文</a>
+            <a href="#papers" onClick={(event) => event.preventDefault()}>浏览论文库</a>
+          </div>
+        </section>
+
+        <section className="content-grid">
+          <div className="panel preview-recent-panel">
+            <div className="panel-head"><h2>最近更新</h2><a href="#all" onClick={(event) => event.preventDefault()}>查看全部</a></div>
+            <article className="paper-row">
+              <div className="paper-icon"><BookOpen size={18} /></div>
+              <div className="paper-main">
+                <strong>Attention Is All You Need: A Structured Review of Transformer Research</strong>
+                <span className="paper-byline">A. Researcher, B. Scholar · 2026 年 · Journal of AI Research</span>
+                <p className="paper-abstract">从模型结构、训练策略与实际应用三个维度整理近期研究进展，并给出可复用的知识脉络。</p>
+                <div className="row-taxonomy">
+                  <div className="taxonomy-group"><span className="taxonomy-label">分类</span><span className="taxonomy-chip cat">人工智能</span></div>
+                  <div className="taxonomy-group"><span className="taxonomy-label">标签</span><span className="taxonomy-chip tag tag-teal">#Transformer</span><span className="taxonomy-chip tag tag-slate">#综述</span></div>
+                </div>
+              </div>
+              <span className="row-status">阅读中</span>
+            </article>
+            <article className="paper-row">
+              <div className="paper-icon"><Database size={18} /></div>
+              <div className="paper-main">
+                <strong>Building Reliable Local-First Research Knowledge Bases</strong>
+                <span className="paper-byline">C. Author · 2025 年 · Data Systems Review</span>
+                <p className="paper-abstract">讨论本地优先的数据组织、全文检索、元数据一致性和安全边界。</p>
+                <div className="row-taxonomy">
+                  <div className="taxonomy-group"><span className="taxonomy-label">分类</span><span className="taxonomy-chip cat">知识管理</span></div>
+                  <div className="taxonomy-group"><span className="taxonomy-label">标签</span><span className="taxonomy-chip tag tag-amber">#Local-first</span></div>
+                </div>
+              </div>
+              <span className="row-status">未读</span>
+            </article>
+          </div>
+
+          <div className="panel">
+            <div className="panel-head"><h2>快捷入口</h2></div>
+            <div className="quick-grid">
+              <a href="#reading" onClick={(event) => event.preventDefault()}><BookOpen size={19} /><span>继续阅读</span><small>查看未读论文</small></a>
+              <a href="#favorites" onClick={(event) => event.preventDefault()}><Star size={19} /><span>我的收藏</span><small>标记为重点的论文</small></a>
+              <a href="#taxonomy" onClick={(event) => event.preventDefault()}><Tags size={19} /><span>分类浏览</span><small>按年份与期刊统计</small></a>
+              <a href="#security" onClick={(event) => event.preventDefault()}><Settings2 size={19} /><span>安全设置</span><small>账号与密码</small></a>
+            </div>
+          </div>
+        </section>
+
+        <NoticeModal open={Boolean(notice)} variant={notice?.variant} message={notice?.message ?? ''} onClose={() => setNotice(null)} />
+      </Shell>
+    </div>
+  )
+}
+
+function ShowcasePage() {
+  const [notice, setNotice] = useState<{ variant: NoticeVariant; message: string } | null>(null)
+
+  return (
+    <div className="showcase-page">
+      <header className="showcase-topbar">
+        <div className="brand">
+          <span className="brand-mark">PA</span>
+          <span className="brand-copy"><strong>Paper Atlas</strong><small>Interface preview</small></span>
+        </div>
+        <ThemeToggle />
+      </header>
+
+      <main className="showcase-main">
+        <section className="showcase-intro">
+          <div>
+            <p className="eyebrow">视觉系统</p>
+            <h1>界面效果预览</h1>
+            <p className="muted">黑白基调、克制的青绿强调，以及清晰的交互反馈。</p>
+          </div>
+          <div className="showcase-actions">
+            <button className="button primary" type="button" onClick={() => setNotice({ variant: 'success', message: '论文信息已保存到知识库。' })}><Save size={16} />保存论文</button>
+            <button className="button secondary" type="button" onClick={() => setNotice({ variant: 'info', message: '同步任务已经加入后台队列。' })}><Download size={16} />同步资料</button>
+            <button className="button danger" type="button" onClick={() => setNotice({ variant: 'warning', message: '此操作需要进一步确认。' })}><Trash2 size={16} />删除记录</button>
+          </div>
+        </section>
+
+        <section className="showcase-band showcase-demo-grid">
+          <div className="showcase-search-stage">
+            <div className="showcase-section-head">
+              <p className="eyebrow">资料检索</p>
+              <h2>快速定位研究内容</h2>
+            </div>
+            <div className="search-field search-inputbox showcase-search">
+              <Search className="search-leading-icon" size={18} />
+              <input aria-label="预览搜索框" placeholder=" " />
+              <span className="search-label">搜索标题、作者、DOI、期刊…</span>
+              <span className="search-fill" aria-hidden="true" />
+            </div>
+            <div className="showcase-filter-row">
+              <span className="tag tag-teal">机器学习</span>
+              <span className="tag tag-slate">2026</span>
+              <span className="tag tag-amber">待读</span>
+            </div>
+          </div>
+          <div className="showcase-loader-stage">
+            <LoadingView text="正在同步知识库…" />
+          </div>
+        </section>
+
+        <section className="showcase-band">
+          <div className="showcase-section-head">
+            <p className="eyebrow">知识概览</p>
+            <h2>研究数据</h2>
+          </div>
+          <div className="showcase-card-grid">
+            <article className="stat-card">
+              <div className="stat-card-head"><span>全部论文</span><BookOpen size={18} /></div>
+              <strong>1,284</strong><small>篇</small>
+            </article>
+            <article className="stat-card tone-green">
+              <div className="stat-card-head"><span>本周新增</span><TrendingUp size={18} /></div>
+              <strong>36</strong><small>篇</small>
+            </article>
+            <article className="stat-card tone-amber">
+              <div className="stat-card-head"><span>待读资料</span><Clock3 size={18} /></div>
+              <strong>18</strong><small>篇</small>
+            </article>
+          </div>
+        </section>
+
+        <section className="showcase-band">
+          <div className="showcase-section-head">
+            <p className="eyebrow">最近收录</p>
+            <h2>论文卡片</h2>
+          </div>
+          <div className="showcase-paper-list">
+            <article className="paper-row">
+              <div className="paper-icon"><BookOpen size={18} /></div>
+              <div className="paper-main">
+                <strong>Attention Is All You Need: A Structured Review of Transformer Research</strong>
+                <span>A. Researcher, B. Scholar · 2026 年</span>
+                <p className="paper-abstract">从模型结构、训练策略与实际应用三个维度整理近期研究进展，并给出可复用的知识脉络。</p>
+              </div>
+              <span className="row-status">阅读中</span>
+            </article>
+            <article className="paper-row">
+              <div className="paper-icon"><Database size={18} /></div>
+              <div className="paper-main">
+                <strong>Building Reliable Local-First Research Knowledge Bases</strong>
+                <span>C. Author · 2025 年</span>
+                <p className="paper-abstract">讨论本地优先的数据组织、全文检索、元数据一致性和安全边界。</p>
+              </div>
+              <span className="row-status">未读</span>
+            </article>
+          </div>
+        </section>
+      </main>
+
+      <NoticeModal
+        open={Boolean(notice)}
+        variant={notice?.variant}
+        message={notice?.message ?? ''}
+        onClose={() => setNotice(null)}
+      />
+    </div>
+  )
+}
+
 export default function App() {
   const [boot, setBoot] = useState<{ initialized: boolean; authed: boolean } | null>(null)
 
@@ -1725,7 +2101,10 @@ export default function App() {
     }
   }, [])
 
-  if (!boot) return <div className="splash">正在连接知识库…</div>
+  if (import.meta.env.DEV && window.location.pathname === '/showcase') return <ShowcasePage />
+  if (import.meta.env.DEV && window.location.pathname === '/preview/dashboard') return <PreviewDashboard />
+
+  if (!boot) return <div className="splash"><LoadingView text="正在连接知识库…" /></div>
   const { initialized, authed } = boot
   const guard = (element: ReactNode) => (authed ? element : <Navigate to="/auth/login" replace />)
   const fallback = initialized ? (authed ? '/app/dashboard' : '/auth/login') : '/setup'

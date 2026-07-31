@@ -19,10 +19,12 @@ func (s *Server) extractPapers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
 		return
 	}
-	if err := r.ParseMultipartForm(s.cfg.UploadMaxBytes); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "unable to read uploaded files")
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.UploadMaxBytes+1024*1024)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "file_too_large", "file exceeds configured limit")
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	fhs := r.MultipartForm.File["files"]
 	if len(fhs) == 0 {
 		writeJSON(w, http.StatusOK, []any{})
