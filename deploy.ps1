@@ -24,14 +24,16 @@ docker compose --env-file $EnvFile -f $ComposeFile config --quiet
 docker compose --env-file $EnvFile -f $ComposeFile up -d --build --remove-orphans
 
 $PortLine = Get-Content $EnvFile | Where-Object { $_ -match '^HTTP_PORT=' } | Select-Object -Last 1
-$HttpPort = if ($PortLine) { ($PortLine -split '=', 2)[1].Trim() } else { '80' }
+$HttpPort = if ($PortLine) { ($PortLine -split '=', 2)[1].Trim() } else { '8081' }
+$PublicURLLine = Get-Content $EnvFile | Where-Object { $_ -match '^PUBLIC_BASE_URL=' } | Select-Object -Last 1
+$PublicURL = if ($PublicURLLine) { (($PublicURLLine -split '=', 2)[1].Trim()).TrimEnd('/') } else { 'https://papers.example.com' }
 
 Write-Host 'Waiting for services to become healthy...'
 for ($i = 0; $i -lt 30; $i++) {
     try {
-        $Response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$HttpPort/api/health" -TimeoutSec 3
+        $Response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$HttpPort/healthz" -TimeoutSec 3
         if ($Response.StatusCode -eq 200) {
-            Write-Host "Deployment completed: http://SERVER_ADDRESS:$HttpPort/setup"
+            Write-Host "Deployment completed: $PublicURL/setup"
             Write-Host 'Enter SETUP_SECRET from .env during first-time setup to create the administrator.'
             exit 0
         }

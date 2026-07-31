@@ -30,11 +30,13 @@ docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --quiet
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build --remove-orphans
 
 HTTP_PORT="$(grep -E '^HTTP_PORT=' "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true)"
-HTTP_PORT="${HTTP_PORT:-80}"
+HTTP_PORT="${HTTP_PORT:-8081}"
+PUBLIC_BASE_URL="$(grep -E '^PUBLIC_BASE_URL=' "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true)"
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://papers.example.com}"
 echo "等待服务启动……"
 for _ in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:${HTTP_PORT}/api/health" >/dev/null 2>&1; then
-    echo "部署完成：http://服务器地址:${HTTP_PORT}/setup"
+  if curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null 2>&1; then
+    echo "部署完成：${PUBLIC_BASE_URL%/}/setup"
     echo "首次初始化时输入 .env 中的 SETUP_SECRET 创建管理员账号。"
     exit 0
   fi

@@ -18,7 +18,7 @@ bash deploy.sh          # Linux
 # 或 .\deploy.ps1       # Windows Server
 ```
 
-完成后打开 `http://服务器IP/setup`，输入 `.env` 中的 `SETUP_SECRET` 创建管理员。详细说明（MySQL 准备、常见问题、备份）见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
+在宿主机 TLS 反向代理中将 HTTPS 域名转发到 `http://127.0.0.1:HTTP_PORT`。完成后打开 `PUBLIC_BASE_URL/setup`，输入 `.env` 中的 `SETUP_SECRET` 创建管理员。详细说明（MySQL 准备、常见问题、备份）见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
 
 ## 本地开发
 
@@ -46,4 +46,4 @@ npm run dev
 - `frontend`: `npm run build`、`npm test` 已通过。
 - 本机未安装 Docker CLI，`docker compose up` 需在部署服务器上执行。
 
-安全注意：不要提交 `.env`、上传目录或数据库凭据。生产环境建议使用 HTTPS 反向代理并将 `COOKIE_SECURE` 设为 `true`。
+安全注意：不要提交 `.env`、上传目录或数据库凭据。生产环境强制使用 HTTPS 反向代理和安全 Cookie。

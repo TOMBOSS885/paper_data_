@@ -43,7 +43,8 @@ export async function api<T>(path: string, init: Options = {}): Promise<T> {
   let response: Response
   try {
     response = await fetch(`${API_BASE}${path}`, { ...rest, headers, credentials: 'include' })
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw new ApiError(0, 'network_error', '无法连接服务，请确认容器正在运行')
   }
   if (!response.ok) {
@@ -100,20 +101,20 @@ export type Facets = {
   missingYear: number
 }
 
-export const setupStatus = () => api<{ data: { initialized: boolean } }>('/setup/status')
+export const setupStatus = (signal?: AbortSignal) => api<{ data: { initialized: boolean } }>('/setup/status', { signal })
 export const createAdmin = (payload: Record<string, string>) => api('/setup/admin', { method: 'POST', body: JSON.stringify(payload) })
 export const login = (payload: Record<string, string>) => api('/auth/login', { method: 'POST', body: JSON.stringify(payload) })
-export const me = (silent401 = false) => api<{ data: { displayName: string; email: string; createdAt: string } }>('/auth/me', { silent401 })
+export const me = (silent401 = false, signal?: AbortSignal) => api<{ data: { displayName: string; email: string; createdAt: string } }>('/auth/me', { silent401, signal })
 export const logout = () => api('/auth/logout', { method: 'POST' })
 export const changePassword = (currentPassword: string, newPassword: string) =>
   api('/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) })
 
-export const papers = (params = '') => api<{ data: { items: Paper[]; total: number; page: number; pageSize: number } }>(`/papers${params}`)
-export const trashPapers = (params = '') =>
-  api<{ data: { items: TrashPaper[]; total: number; page: number; pageSize: number; retentionDays: number } }>(`/trash${params}`)
+export const papers = (params = '', signal?: AbortSignal) => api<{ data: { items: Paper[]; total: number; page: number; pageSize: number } }>(`/papers${params}`, { signal })
+export const trashPapers = (params = '', signal?: AbortSignal) =>
+  api<{ data: { items: TrashPaper[]; total: number; page: number; pageSize: number; retentionDays: number } }>(`/trash${params}`, { signal })
 export const restoreTrashPaper = (id: string) =>
   api<{ data: { id: string; restored: boolean } }>(`/trash/${encodeURIComponent(id)}/restore`, { method: 'POST' })
-export const paper = (id: string) => api<{ data: PaperDetail }>(`/papers/${encodeURIComponent(id)}`)
+export const paper = (id: string, signal?: AbortSignal) => api<{ data: PaperDetail }>(`/papers/${encodeURIComponent(id)}`, { signal })
 export const updatePaper = (id: string, payload: Record<string, unknown>) =>
   api<{ data: PaperDetail }>(`/papers/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) })
 export const removePaper = (id: string) => api(`/papers/${encodeURIComponent(id)}`, { method: 'DELETE' })
@@ -150,15 +151,15 @@ export const fileUrl = (id: string, kind: 'preview' | 'download') => `${API_BASE
 
 import { useQuery } from '@tanstack/react-query'
 
-export const listTags = () => api<{ data: { items: Tag[] } }>('/tags', { cache: 'no-store' })
-export const useTags = () => useQuery<Tag[]>({ queryKey: ['tags'], queryFn: () => listTags().then(r => r.data.items), placeholderData: [] })
+export const listTags = (signal?: AbortSignal) => api<{ data: { items: Tag[] } }>('/tags', { cache: 'no-store', signal })
+export const useTags = () => useQuery<Tag[]>({ queryKey: ['tags'], queryFn: ({ signal }) => listTags(signal).then(r => r.data.items), placeholderData: [] })
 
 export const createTag = (name: string, color: string) => api<Tag>('/tags', { method: 'POST', body: JSON.stringify({ name, color }) })
 export const deleteTag = async (id: number) => {
   await api(`/tags/${id}`, { method: 'DELETE' })
 }
-export const listCategories = () => api<{ data: { items: Category[] } }>('/categories', { cache: 'no-store' })
-export const useCategories = () => useQuery<Category[]>({ queryKey: ['categories'], queryFn: () => listCategories().then(r => r.data.items), placeholderData: [] })
+export const listCategories = (signal?: AbortSignal) => api<{ data: { items: Category[] } }>('/categories', { cache: 'no-store', signal })
+export const useCategories = () => useQuery<Category[]>({ queryKey: ['categories'], queryFn: ({ signal }) => listCategories(signal).then(r => r.data.items), placeholderData: [] })
 export const createCategory = (payload: { name: string; parentId?: number | null; sortOrder?: number }) =>
   api<Category>('/categories', { method: 'POST', body: JSON.stringify(payload) })
 export const deleteCategory = async (id: number) => {
@@ -166,8 +167,8 @@ export const deleteCategory = async (id: number) => {
 }
 
 export const facets = () => api<{ data: Facets }>('/facets')
-export const dashboard = () =>
-  api<{ data: { totalPapers?: number; importedLast30Days?: number; unread?: number; favorites?: number; storageBytes?: number; recent?: Paper[] } }>('/dashboard')
+export const dashboard = (signal?: AbortSignal) =>
+  api<{ data: { totalPapers?: number; importedLast30Days?: number; unread?: number; favorites?: number; storageBytes?: number; recent?: Paper[] } }>('/dashboard', { signal })
 
 export const TAG_COLORS: { value: string; label: string }[] = [
   { value: 'teal', label: '青绿' },

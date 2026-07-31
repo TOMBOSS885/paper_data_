@@ -18,4 +18,5 @@ USER 65532:65532
 ENV SERVER_HOST=0.0.0.0 SERVER_PORT=8080 UPLOAD_DIR=/app/uploads
 EXPOSE 8080
 VOLUME ["/app/uploads"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/app/paper-kb", "healthcheck"]
 ENTRYPOINT ["/app/paper-kb"]

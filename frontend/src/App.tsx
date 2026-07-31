@@ -2,7 +2,7 @@ import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, DragEvent, ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, BookOpen, CheckCircle2, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, Info, LayoutDashboard, LogOut, Menu, Moon, RotateCcw, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, TriangleAlert, Upload, X } from 'lucide-react'
 import {
   ApiError,
@@ -59,6 +59,7 @@ const MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 const STATUS_LABELS: Record<string, string> = { unread: '未读', reading: '阅读中', read: '已读' }
 
 const errorMessage = (e: unknown) => (e instanceof ApiError || e instanceof Error ? e.message : '操作失败，请重试')
+const isAbortError = (e: unknown) => e instanceof DOMException && e.name === 'AbortError'
 const statusLabel = (v?: string) => STATUS_LABELS[v ?? 'unread'] ?? '未读'
 const authorLine = (p: Paper) => {
   const names = (p.authors ?? []).map((a) => (typeof a === 'string' ? a : a?.name)).filter(Boolean)
@@ -300,22 +301,19 @@ function Login() {
 }
 
 function Dashboard() {
-  const [data, setData] = useState<{ totalPapers: number; importedLast30Days: number; unread: number; storageBytes: number; recent: Paper[] } | null>(null)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    dashboard()
-      .then((r) =>
-        setData({
+  const [errorDismissed, setErrorDismissed] = useState(false)
+  const dashboardQuery = useQuery({
+    queryKey: ['dashboard'],
+    queryFn: ({ signal }) => dashboard(signal).then((r) => ({
           totalPapers: r.data.totalPapers ?? 0,
           importedLast30Days: r.data.importedLast30Days ?? 0,
           unread: r.data.unread ?? 0,
           storageBytes: r.data.storageBytes ?? 0,
           recent: r.data.recent ?? [],
-        }),
-      )
-      .catch((e) => setError(errorMessage(e)))
-  }, [])
+        })),
+  })
+  const data = dashboardQuery.data ?? null
+  const dashboardError = !errorDismissed && dashboardQuery.error ? errorMessage(dashboardQuery.error) : ''
 
   const stats = [
     { label: '论文总数', value: data?.totalPapers ?? '—', unit: '篇', icon: BookOpen, tone: 'blue' },
@@ -334,7 +332,7 @@ function Dashboard() {
         </div>
         <Link className="button primary" to="/app/import"><Upload size={17} />导入论文</Link>
       </div>
-      <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
+      <NoticeModal open={Boolean(dashboardError)} variant="error" message={dashboardError} onClose={() => setErrorDismissed(true)} />
       <section className="stat-grid">
         {stats.map(({ label, value, unit, icon: Icon, tone }) => (
           <div className={`stat-card tone-${tone}`} key={label}>
@@ -521,21 +519,13 @@ function NoticeModal({
 function LoadingView({ text = '加载中…' }: { text?: string }) {
   return (
     <div className="loading" role="status" aria-live="polite">
-      <div className="wifi-loader" aria-hidden="true">
-        <svg className="circle-outer" viewBox="0 0 86 86">
-          <circle className="back" cx="43" cy="43" r="40" />
-          <circle className="front" cx="43" cy="43" r="40" />
-          <circle className="new" cx="43" cy="43" r="40" />
+      <div className="morph-loader" aria-hidden="true">
+        <svg viewBox="0 0 100 100">
+          <path d="M10,20 C10,17.24 11.12,14.74 12.93,12.93 C14.74,11.12 17.24,10 20,10 L80,10 C82.76,10 85.26,11.12 87.07,12.93 C88.88,14.74 90,17.24 90,20 L90,80 C90,82.76 88.88,85.26 87.07,87.07 C85.26,88.88 82.76,90 80,90 L20,90 C17.24,90 14.74,88.88 12.93,87.07 C11.12,85.26 10,82.76 10,80Z M68,50 C68,45.02 65.98,40.52 62.72,37.27 C59.47,34.01 54.97,32 50,32 C45.02,32 40.52,34.01 37.27,37.27 C34.01,40.52 32,45.02 32,50 C32,54.97 34.01,59.47 37.27,62.72 C40.52,65.98 45.02,68 50,68 C54.97,68 59.47,65.98 62.72,62.72 C65.98,59.47 68,54.97 68,50Z" />
+          <path d="M10,20 C10,17.24 11.12,14.74 12.93,12.93 C14.74,11.12 17.24,10 20,10 L80,10 C82.76,10 85.26,11.12 87.07,12.93 C88.88,14.74 90,17.24 90,20 L90,80 C90,82.76 88.88,85.26 87.07,87.07 C85.26,88.88 82.76,90 80,90 L20,90 C17.24,90 14.74,88.88 12.93,87.07 C11.12,85.26 10,82.76 10,80Z" />
+          <path d="M10,37.57 C10,34.92 11.05,32.37 12.92,30.5 L30.5,12.92 C32.37,11.05 34.92,10 37.57,10 L62.42,10 C65.07,10 67.62,11.05 69.49,12.92 L87.07,30.5 C88.94,32.37 90,34.92 90,37.57 L90,62.42 C90,65.07 88.94,67.62 87.07,69.49 L69.49,87.07 C67.62,88.94 65.07,90 62.42,90 L37.57,90 C34.92,90 32.37,88.94 30.5,87.07 L12.92,69.49 C11.05,67.62 10,65.07 10,62.42Z" />
+          <path d="M10,50 C10,38.95 14.48,28.95 21.72,21.72 C28.95,14.48 38.95,10 50,10 C61.05,10 71.05,14.48 78.28,21.72 C85.52,28.95 90,38.95 90,50 C90,61.05 85.52,71.05 78.28,78.28 C71.05,85.52 61.05,90 50,90 C38.95,90 28.95,85.52 21.72,78.28 C14.48,71.05 10,61.05 10,50Z" />
         </svg>
-        <svg className="circle-middle" viewBox="0 0 60 60">
-          <circle className="back" cx="30" cy="30" r="27" />
-          <circle className="front" cx="30" cy="30" r="27" />
-        </svg>
-        <svg className="circle-inner" viewBox="0 0 34 34">
-          <circle className="back" cx="17" cy="17" r="14" />
-          <circle className="front" cx="17" cy="17" r="14" />
-        </svg>
-        <span className="wifi-dot" />
       </div>
       <span className="loading-text" data-text={text}>{text}</span>
     </div>
@@ -822,23 +812,25 @@ function Papers() {
 
   useEffect(() => {
     let alive = true
+    const controller = new AbortController()
     setLoading(true)
     setError('')
-    fetchPapers(queryString)
+    fetchPapers(queryString, controller.signal)
       .then((r) => {
         if (!alive) return
         setItems(r.data.items ?? [])
         setTotal(r.data.total ?? 0)
       })
       .catch((e) => {
-        if (!alive) return
+        if (!alive || isAbortError(e)) return
         setItems([])
         setTotal(0)
         setError(errorMessage(e))
       })
-      .finally(() => alive && setLoading(false))
+      .finally(() => alive && !controller.signal.aborted && setLoading(false))
     return () => {
       alive = false
+      controller.abort()
     }
   }, [queryString])
 
@@ -1128,25 +1120,28 @@ function Trash() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
     setError('')
     try {
       const query = `?page=${page}&pageSize=${PAGE_SIZE}`
-      const response = await trashPapers(query)
+      const response = await trashPapers(query, signal)
       setItems(response.data.items ?? [])
       setTotal(response.data.total ?? 0)
       setRetentionDays(response.data.retentionDays ?? 10)
     } catch (e) {
+      if (isAbortError(e)) return
       setError(errorMessage(e))
       setItems([])
     } finally {
-      setLoading(false)
+      if (!signal?.aborted) setLoading(false)
     }
   }, [page])
 
   useEffect(() => {
-    void load()
+    const controller = new AbortController()
+    void load(controller.signal)
+    return () => controller.abort()
   }, [load])
 
   const restore = useCallback(async (id: string) => {
@@ -1235,18 +1230,20 @@ function PaperDetailPage() {
 
   useEffect(() => {
     let alive = true
+    const controller = new AbortController()
     setLoading(true)
     Promise.all([
-      fetchPaper(id),
+      fetchPaper(id, controller.signal),
     ])
       .then(([paper]) => {
         if (!alive) return
         apply(paper.data)
       })
-      .catch((e) => alive && setError(errorMessage(e)))
-      .finally(() => alive && setLoading(false))
+      .catch((e) => alive && !isAbortError(e) && setError(errorMessage(e)))
+      .finally(() => alive && !controller.signal.aborted && setLoading(false))
     return () => {
       alive = false
+      controller.abort()
     }
   }, [id])
 
@@ -1866,9 +1863,11 @@ function Security() {
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    me()
+    const controller = new AbortController()
+    me(false, controller.signal)
       .then((r) => setAccount(r.data))
-      .catch((e) => setError(errorMessage(e)))
+      .catch((e) => !isAbortError(e) && setError(errorMessage(e)))
+    return () => controller.abort()
   }, [])
 
   const submit = async () => {
@@ -2133,17 +2132,19 @@ export default function App() {
 
   useEffect(() => {
     let alive = true
+    const controller = new AbortController()
     // 两个请求都完成后再决定路由，避免先跳登录页再跳回来的闪烁。
     Promise.all([
-      setupStatus()
+      setupStatus(controller.signal)
         .then((r) => r.data.initialized)
         .catch(() => true),
-      me(true)
+      me(true, controller.signal)
         .then(() => true)
         .catch(() => false),
     ]).then(([initialized, authed]) => alive && setBoot({ initialized, authed }))
     return () => {
       alive = false
+      controller.abort()
     }
   }, [])
 

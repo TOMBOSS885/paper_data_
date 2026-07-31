@@ -12,8 +12,9 @@ COPY frontend .
 RUN npm run build
 
 FROM ${NGINX_IMAGE}
+ENV NGINX_HOST=127.0.0.1 NGINX_PORT=80 API_PORT=8080
 COPY --from=build /src/dist /usr/share/nginx/html
-# 模板由镜像入口脚本用 NGINX_PORT/API_PORT 环境变量渲染成 conf.d/default.conf
+# 模板由镜像入口脚本用 NGINX_HOST/NGINX_PORT/API_PORT 环境变量渲染成 conf.d/default.conf
 COPY deploy/nginx.conf.template /etc/nginx/templates/default.conf.template
 RUN rm -f /etc/nginx/conf.d/default.conf
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -q -O /dev/null "http://127.0.0.1:${NGINX_PORT:-80}/healthz" || exit 1

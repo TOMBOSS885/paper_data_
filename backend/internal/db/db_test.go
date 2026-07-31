@@ -33,3 +33,43 @@ func TestTrashMigrationIsSafeForExistingSoftDeletesAndRetries(t *testing.T) {
 		}
 	}
 }
+
+func TestPaperQueryIndexMigrationRepairsCountersAndIsRetrySafe(t *testing.T) {
+	body, err := migrations.ReadFile("migrations/009_paper_query_indexes.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(body)
+	for _, required := range []string{
+		"SET t.usage_count = COALESCE(counts.active_count, 0)",
+		"SET c.paper_count = COALESCE(counts.active_count, 0)",
+		"information_schema.statistics",
+		"idx_papers_active_added",
+		"idx_papers_active_updated",
+		"idx_papers_active_published",
+		"idx_papers_active_status_added",
+		"idx_papers_active_favorite_added",
+		"idx_papers_active_doi",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Errorf("migration does not contain %q", required)
+		}
+	}
+}
+
+func TestSessionTokenVersionMigrationIsRetrySafe(t *testing.T) {
+	body, err := migrations.ReadFile("migrations/008_session_token_version.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(body)
+	for _, required := range []string{
+		"information_schema.columns",
+		"column_name = 'token_version'",
+		"ALTER TABLE sessions ADD COLUMN token_version",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Errorf("migration does not contain %q", required)
+		}
+	}
+}

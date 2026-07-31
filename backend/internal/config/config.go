@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -66,11 +67,26 @@ func (c Config) validate() error {
 	if len(c.SetupSecret) < 32 {
 		return errors.New("SETUP_SECRET must contain at least 32 bytes")
 	}
-	if c.Env == "production" && c.SetupSecret == c.JWTSecret {
+	if strings.EqualFold(c.Env, "production") && c.SetupSecret == c.JWTSecret {
 		return errors.New("SETUP_SECRET must be a separate random secret in production")
+	}
+	if strings.EqualFold(c.Env, "production") {
+		publicURL, err := url.Parse(c.PublicBaseURL)
+		if err != nil || !strings.EqualFold(publicURL.Scheme, "https") || publicURL.Host == "" {
+			return errors.New("PUBLIC_BASE_URL must be an absolute https URL in production")
+		}
+		if !c.CookieSecure {
+			return errors.New("COOKIE_SECURE must be true in production")
+		}
 	}
 	if c.SearchMaxPageSize < 1 || c.SearchMaxPageSize > 100 {
 		return errors.New("SEARCH_MAX_PAGE_SIZE must be between 1 and 100")
+	}
+	if c.UploadMaxBytes < 1 {
+		return errors.New("UPLOAD_MAX_BYTES must be at least 1")
+	}
+	if c.UploadQuotaBytes < c.UploadMaxBytes {
+		return errors.New("UPLOAD_QUOTA_BYTES must be at least UPLOAD_MAX_BYTES")
 	}
 	if c.LoginMaxFails < 1 {
 		return errors.New("LOGIN_LIMIT_MAX_FAILS must be at least 1")

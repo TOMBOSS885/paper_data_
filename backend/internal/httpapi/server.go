@@ -38,7 +38,17 @@ type Server struct {
 	cfg     config.Config
 	db      *sql.DB
 	limiter *limiter
+
+	uploadOnce     sync.Once
+	uploadSlots    chan struct{}
+	uploadQuotaMu  sync.Mutex
+	uploadReserved int64
 }
+
+const (
+	maxUploadWorkers   = 4
+	metadataPrefixSize = 1 << 20
+)
 
 // limiter：每个 key 独立的 token bucket
 // 后台 GC goroutine 每 5 分钟扫一次长期未访问的 bucket，避免内存泄漏。
@@ -89,7 +99,29 @@ func (l *limiter) allow(key string, max int, window time.Duration) bool {
 }
 
 func New(cfg config.Config, db *sql.DB) *Server {
-	return &Server{cfg: cfg, db: db, limiter: newLimiter()}
+	s := &Server{cfg: cfg, db: db, limiter: newLimiter()}
+	s.initUploadSlots()
+	return s
+}
+
+func (s *Server) initUploadSlots() {
+	s.uploadOnce.Do(func() {
+		s.uploadSlots = make(chan struct{}, maxUploadWorkers)
+	})
+}
+
+func (s *Server) acquireUploadSlot(ctx context.Context) error {
+	s.initUploadSlots()
+	select {
+	case s.uploadSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) releaseUploadSlot() {
+	<-s.uploadSlots
 }
 
 func (s *Server) Handler() http.Handler {
@@ -382,13 +414,27 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	var id uint64
 	var display, passwordHash string
-	var fails int
-	var locked sql.NullTime
-	err := s.db.QueryRowContext(r.Context(), `SELECT id,display_name,password_hash,failed_login_attempts,locked_until FROM admins WHERE email=?`, strings.ToLower(strings.TrimSpace(req.Email))).Scan(&id, &display, &passwordHash, &fails, &locked)
-	if err != nil || (locked.Valid && locked.Time.After(time.Now())) || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)) != nil {
-		if err == nil {
-			fails++
-			_, _ = s.db.ExecContext(r.Context(), `UPDATE admins SET failed_login_attempts=?, locked_until=CASE WHEN ? >= ? THEN UTC_TIMESTAMP(6)+INTERVAL 10 MINUTE ELSE locked_until END WHERE id=?`, fails, fails, s.cfg.LoginMaxFails, id)
+	var locked bool
+	err := s.db.QueryRowContext(r.Context(), `SELECT id,display_name,password_hash,(locked_until IS NOT NULL AND locked_until>UTC_TIMESTAMP(6)) FROM admins WHERE email=?`, strings.ToLower(strings.TrimSpace(req.Email))).Scan(&id, &display, &passwordHash, &locked)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid credentials")
+		return
+	}
+	// Do not move the deadline while an account is locked. Otherwise an attacker
+	// who knows the email address can keep the administrator locked out forever.
+	if locked {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid credentials")
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)) != nil {
+		// The increment and threshold check must use the same row value so
+		// concurrent failures cannot overwrite each other.
+		if _, err := s.db.ExecContext(r.Context(), `UPDATE admins
+			SET locked_until=CASE WHEN failed_login_attempts+1 >= ? THEN UTC_TIMESTAMP(6)+INTERVAL 10 MINUTE ELSE NULL END,
+				failed_login_attempts=failed_login_attempts+1
+			WHERE id=? AND (locked_until IS NULL OR locked_until<=UTC_TIMESTAMP(6))`, s.cfg.LoginMaxFails, id); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to record login attempt")
+			return
 		}
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid credentials")
 		return
@@ -396,7 +442,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	_, _ = s.db.ExecContext(r.Context(), `UPDATE admins SET failed_login_attempts=0, locked_until=NULL WHERE id=?`, id)
 	token, csrf := randomToken(32), randomToken(32)
-	_, err = s.db.ExecContext(r.Context(), `INSERT INTO sessions(id,admin_id,token_hash,csrf_hash,ip_address,user_agent,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`, uuid.NewString(), id, s.secureHash(token), s.secureHash(csrf), clientIP(r), r.UserAgent(), now.Add(s.cfg.SessionTTL), now)
+	_, err = s.db.ExecContext(r.Context(), `INSERT INTO sessions(id,admin_id,token_version,token_hash,csrf_hash,ip_address,user_agent,expires_at,created_at)
+		SELECT ?,id,token_version,?,?,?,?,?,? FROM admins WHERE id=?`, uuid.NewString(), s.secureHash(token), s.secureHash(csrf), clientIP(r), r.UserAgent(), now.Add(s.cfg.SessionTTL), now, id)
 	if err != nil {
 		writeError(w, 500, "internal_error", "unable to create session")
 		return
@@ -634,11 +681,30 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to secure password")
 		return
 	}
-	if _, err := s.db.ExecContext(r.Context(), `UPDATE admins SET password_hash=?, password_changed_at=UTC_TIMESTAMP(6), updated_at=UTC_TIMESTAMP(6), token_version=token_version+1, failed_login_attempts=0, locked_until=NULL WHERE id=?`, string(next), id); err != nil {
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update password")
 		return
 	}
-	_, _ = s.db.ExecContext(r.Context(), `UPDATE sessions SET revoked_at=UTC_TIMESTAMP(6) WHERE admin_id=? AND revoked_at IS NULL`, id)
+	defer tx.Rollback()
+	result, err := tx.ExecContext(r.Context(), `UPDATE admins SET password_hash=?, password_changed_at=UTC_TIMESTAMP(6), updated_at=UTC_TIMESTAMP(6), token_version=token_version+1, failed_login_attempts=0, locked_until=NULL WHERE id=? AND password_hash=?`, string(next), id, hash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update password")
+		return
+	}
+	updated, err := result.RowsAffected()
+	if err != nil || updated != 1 {
+		writeError(w, http.StatusConflict, "password_changed", "password changed concurrently; please sign in again")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE sessions SET revoked_at=UTC_TIMESTAMP(6) WHERE admin_id=? AND revoked_at IS NULL`, id); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to revoke sessions")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update password")
+		return
+	}
 	http.SetCookie(w, &http.Cookie{Name: "pkb_session", Path: "/", MaxAge: -1, HttpOnly: true})
 	http.SetCookie(w, &http.Cookie{Name: "pkb_csrf", Path: "/", MaxAge: -1})
 	writeJSON(w, http.StatusOK, map[string]any{"passwordChanged": true, "sessionsRevoked": true})
@@ -660,6 +726,19 @@ var tagColorAllowed = map[string]bool{"teal": true, "blue": true, "amber": true,
 // 包级编译一次；用正则一次性把任何空白序列（含 \r \n \t 全角空格）压成单个空格，
 // 避免 strings.ReplaceAll("  "," ") 这种 O(N²) 暴力循环在大输入下 CPU 飙升。
 var wsCollapse = regexp.MustCompile(`\s+`)
+var doiQueryPattern = regexp.MustCompile(`(?i)^10\.\d{4,9}/\S+$`)
+
+func normalizeDOIQuery(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"doi:", "https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/"} {
+		if strings.HasPrefix(lower, prefix) {
+			value = strings.TrimSpace(value[len(prefix):])
+			break
+		}
+	}
+	return value, doiQueryPattern.MatchString(value)
+}
 
 func normalizeName(s string) string {
 	s = strings.TrimSpace(s)
@@ -1020,17 +1099,30 @@ func (s *Server) bulkTxOnPapers(ctx context.Context, paperIDs []string, do func(
 	for i, id := range paperIDs {
 		args[i] = id
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM papers WHERE id IN (`+ph+`) AND deleted_at IS NULL`, args...)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM papers WHERE id IN (`+ph+`) AND deleted_at IS NULL ORDER BY id FOR UPDATE`, args...)
 	if err != nil {
 		return nil, nil, err
 	}
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err == nil {
-			existing = append(existing, id)
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, nil, err
 		}
+		existing = append(existing, id)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
 	if len(existing) == 0 {
 		return nil, paperIDs, nil
 	}
@@ -1043,11 +1135,6 @@ func (s *Server) bulkTxOnPapers(ctx context.Context, paperIDs []string, do func(
 			missing = append(missing, id)
 		}
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer tx.Rollback()
 	if err := do(tx, existing); err != nil {
 		return nil, nil, err
 	}
@@ -1091,9 +1178,12 @@ func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, pap
 	defer tx.Rollback()
 
 	// 确认论文存在，避免对已删除论文留下孤儿。
-	var paperExists int
-	if err := tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM papers WHERE id=? AND deleted_at IS NULL`, paperID).Scan(&paperExists); err != nil || paperExists == 0 {
+	var lockedPaperID string
+	if err := tx.QueryRowContext(r.Context(), `SELECT id FROM papers WHERE id=? AND deleted_at IS NULL FOR UPDATE`, paperID).Scan(&lockedPaperID); err == sql.ErrNoRows {
 		writeError(w, http.StatusNotFound, "not_found", "paper not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to lock paper")
 		return
 	}
 
@@ -1124,20 +1214,35 @@ func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, pap
 	}
 	for oldRows.Next() {
 		var id uint64
-		if err := oldRows.Scan(&id); err == nil {
-			oldIDs = append(oldIDs, id)
+		if err := oldRows.Scan(&id); err != nil {
+			oldRows.Close()
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to read taxonomy")
+			return
 		}
+		oldIDs = append(oldIDs, id)
 	}
-	oldRows.Close()
+	if err := oldRows.Err(); err != nil {
+		oldRows.Close()
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to read taxonomy")
+		return
+	}
+	if err := oldRows.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to read taxonomy")
+		return
+	}
 
 	// 校验新 ID 全部存在，避免写入悬挂引用（FK 已经防住，但提前校验能给出更友好提示）。
 	if len(seen) > 0 {
-		newList := make([]any, 0, len(seen))
+		newIDs := make([]uint64, 0, len(seen))
 		for id := range seen {
-			newList = append(newList, id)
+			newIDs = append(newIDs, id)
 		}
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(newList)), ",")
-		checkSQL := `SELECT id FROM ` + countJoin + ` WHERE id IN (` + placeholders + `)`
+		sort.Slice(newIDs, func(i, j int) bool { return newIDs[i] < newIDs[j] })
+		newList := make([]any, len(newIDs))
+		for i, id := range newIDs {
+			newList[i] = id
+		}
+		checkSQL := `SELECT id FROM ` + countJoin + ` WHERE id IN (` + placeholders(len(newList)) + `) ORDER BY id FOR UPDATE`
 		checkRows, err := tx.QueryContext(r.Context(), checkSQL, newList...)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
@@ -1146,11 +1251,22 @@ func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, pap
 		found := make(map[uint64]struct{}, len(seen))
 		for checkRows.Next() {
 			var id uint64
-			if err := checkRows.Scan(&id); err == nil {
-				found[id] = struct{}{}
+			if err := checkRows.Scan(&id); err != nil {
+				checkRows.Close()
+				writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+				return
 			}
+			found[id] = struct{}{}
 		}
-		checkRows.Close()
+		if err := checkRows.Err(); err != nil {
+			checkRows.Close()
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+			return
+		}
+		if err := checkRows.Close(); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+			return
+		}
 		if len(found) != len(seen) {
 			writeError(w, http.StatusBadRequest, "invalid_request", "one or more ids do not exist")
 			return
@@ -1205,20 +1321,27 @@ func (s *Server) updatePaperTaxonomy(w http.ResponseWriter, r *http.Request, pap
 			remove = append(remove, id)
 		}
 	}
-	adjustCount := func(ids []uint64, delta int) {
+	adjustCount := func(ids []uint64, delta int) error {
 		if len(ids) == 0 {
-			return
+			return nil
 		}
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		args := make([]any, 0, len(ids)+1)
 		args = append(args, delta)
 		for _, id := range ids {
 			args = append(args, id)
 		}
-		_, _ = tx.ExecContext(r.Context(), `UPDATE `+countJoin+` SET `+countColumn+`=GREATEST(0, `+countColumn+`+?) WHERE id IN (`+placeholders+`)`, args...)
+		_, err := tx.ExecContext(r.Context(), `UPDATE `+countJoin+` SET `+countColumn+`=GREATEST(0, CAST(`+countColumn+` AS SIGNED)+?) WHERE id IN (`+placeholders(len(ids))+`)`, args...)
+		return err
 	}
-	adjustCount(add, +1)
-	adjustCount(remove, -1)
+	if err := adjustCount(add, +1); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update taxonomy counts")
+		return
+	}
+	if err := adjustCount(remove, -1); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to update taxonomy counts")
+		return
+	}
 
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to commit taxonomy")
@@ -1281,15 +1404,8 @@ func (s *Server) bulkFavorite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing, missing, err := s.bulkTxOnPapers(r.Context(), paperIDs, func(tx *sql.Tx, ids []string) error {
-		ph := placeholders(len(ids))
-		args := make([]any, 0, len(ids)+1)
-		args = append(args, req.IsFavorite, time.Now().UTC())
-		for _, pid := range ids {
-			args = append(args, pid)
-		}
-		_, err := tx.ExecContext(r.Context(),
-			`UPDATE papers SET is_favorite=?, updated_at=UTC_TIMESTAMP(6) WHERE id IN (`+ph+`) AND deleted_at IS NULL`,
-			args...)
+		query, args := bulkFavoriteUpdate(ids, req.IsFavorite)
+		_, err := tx.ExecContext(r.Context(), query, args...)
 		return err
 	})
 	if err != nil {
@@ -1297,6 +1413,16 @@ func (s *Server) bulkFavorite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"updated": len(existing), "missing": missing})
+}
+
+func bulkFavoriteUpdate(ids []string, favorite bool) (string, []any) {
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, favorite)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := `UPDATE papers SET is_favorite=?, updated_at=UTC_TIMESTAMP(6) WHERE id IN (` + placeholders(len(ids)) + `) AND deleted_at IS NULL`
+	return query, args
 }
 
 // bulkUpdateTaxonomy 一组论文的标签/分类替换（replace 模式）。
@@ -1384,11 +1510,22 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 		found := 0
 		for rows.Next() {
 			var x uint64
-			if err := rows.Scan(&x); err == nil {
-				found++
+			if err := rows.Scan(&x); err != nil {
+				rows.Close()
+				writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+				return
 			}
+			found++
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+			return
+		}
+		if err := rows.Close(); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "unable to validate ids")
+			return
+		}
 		if found != len(seen) {
 			writeError(w, http.StatusBadRequest, "invalid_request", "one or more ids do not exist")
 			return
@@ -1412,14 +1549,21 @@ func (s *Server) bulkUpdateTaxonomy(w http.ResponseWriter, r *http.Request, kind
 			var pid string
 			var xid uint64
 			if err := rows.Scan(&pid, &xid); err != nil {
-				continue
+				rows.Close()
+				return err
 			}
 			if _, ok := old[pid]; !ok {
 				old[pid] = make(map[uint64]struct{})
 			}
 			old[pid][xid] = struct{}{}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
 
 		// 差量计数：全局 add / remove 聚合
 		addTotal := make(map[uint64]int)
@@ -1549,27 +1693,32 @@ func (s *Server) listPapers(w http.ResponseWriter, r *http.Request) {
 		if len(rawKw) > 200 {
 			rawKw = rawKw[:200]
 		}
-		safe := strings.Map(func(r rune) rune {
-			if strings.ContainsRune(`+-><~*()"`+"`@", r) {
-				return ' '
+		if doi, ok := normalizeDOIQuery(rawKw); ok {
+			where = append(where, "normalized_doi=?")
+			args = append(args, strings.ToLower(doi))
+		} else {
+			safe := strings.Map(func(r rune) rune {
+				if strings.ContainsRune(`+-><~*()"`+"`@", r) {
+					return ' '
+				}
+				return r
+			}, rawKw)
+			safe = strings.TrimSpace(safe)
+
+			var kwWhere []string
+			// 先尝试 FULLTEXT：title/abstract 上有 ngram 索引的情况下能走索引，避免全表扫
+			if safe != "" {
+				kwWhere = append(kwWhere, "MATCH(title, abstract_text) AGAINST(? IN NATURAL LANGUAGE MODE)")
+				args = append(args, safe)
 			}
-			return r
-		}, rawKw)
-		safe = strings.TrimSpace(safe)
+			// 兜底：DOI / journal / authors_json 没有 FULLTEXT，仍然走 LIKE
+			like := "%" + escapeLike(rawKw) + "%"
+			kwWhere = append(kwWhere, "(journal LIKE ? OR authors_json LIKE ?)")
+			args = append(args, like, like)
 
-		var kwWhere []string
-		// 先尝试 FULLTEXT：title/abstract 上有 ngram 索引的情况下能走索引，避免全表扫
-		if safe != "" {
-			kwWhere = append(kwWhere, "MATCH(title, abstract_text) AGAINST(? IN NATURAL LANGUAGE MODE)")
-			args = append(args, safe)
+			// 必须将全文索引和 LIKE 用 OR 连接起来，否则就变成了求交集
+			where = append(where, "("+strings.Join(kwWhere, " OR ")+")")
 		}
-		// 兜底：DOI / journal / authors_json 没有 FULLTEXT，仍然走 LIKE
-		like := "%" + escapeLike(rawKw) + "%"
-		kwWhere = append(kwWhere, "(COALESCE(doi,'') LIKE ? OR journal LIKE ? OR authors_json LIKE ?)")
-		args = append(args, like, like, like)
-
-		// 必须将全文索引和 LIKE 用 OR 连接起来，否则就变成了求交集
-		where = append(where, "("+strings.Join(kwWhere, " OR ")+")")
 	}
 	if st := query.Get("status"); st == "unread" || st == "reading" || st == "read" {
 		where = append(where, "reading_status=?")
@@ -1797,7 +1946,6 @@ func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
 	var mu sync.Mutex
 	accepted := 0
 
-	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 
 	for i, fh := range files {
@@ -1805,9 +1953,6 @@ func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
 			item, err := s.saveUpload(r.Context(), fh)
 
 			mu.Lock()
@@ -1828,7 +1973,7 @@ func (s *Server) uploadPapers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"jobId": uuid.NewString(), "accepted": accepted, "rejected": len(items) - accepted, "items": items})
 }
-func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[string]any, error) {
+func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (_ map[string]any, retErr error) {
 	if fh.Size <= 0 || fh.Size > s.cfg.UploadMaxBytes {
 		return nil, fmt.Errorf("file size is not allowed")
 	}
@@ -1837,43 +1982,75 @@ func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[
 	if !allowed[ext] {
 		return nil, fmt.Errorf("unsupported file type")
 	}
-	f, err := fh.Open()
-	if err != nil {
+	if err := s.acquireUploadSlot(ctx); err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	head := make([]byte, 512)
-	n, _ := io.ReadFull(f, head)
-	head = head[:n]
-	if ext == ".pdf" && !strings.HasPrefix(string(head), "%PDF-") {
-		return nil, fmt.Errorf("file signature mismatch")
+	defer s.releaseUploadSlot()
+	if err := s.reserveUploadQuota(ctx, fh.Size); err != nil {
+		return nil, err
 	}
-	var meta pdfmeta.Extracted
-	if ext == ".pdf" && strings.HasPrefix(string(head), "%PDF-") {
-		f.Seek(0, 0)
-		if raw, err := io.ReadAll(f); err == nil {
-			meta = pdfmeta.Extract(raw)
-		}
-	}
-	f.Seek(0, 0)
+	defer s.releaseUploadQuota(fh.Size)
 
 	if err := os.MkdirAll(s.cfg.UploadDir, 0700); err != nil {
 		return nil, err
 	}
 	id := uuid.NewString()
-	path := filepath.Join(s.cfg.UploadDir, id+ext)
-	out, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	objectKey := id + ext
+	stagingPath := filepath.Join(s.cfg.UploadDir, ".upload-"+id+".tmp")
+	finalPath := filepath.Join(s.cfg.UploadDir, objectKey)
+	stagingExists := false
+	finalExists := false
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if stagingExists {
+			retErr = removeFailedUpload(stagingPath, retErr)
+		}
+		if finalExists {
+			retErr = removeFailedUpload(finalPath, retErr)
+		}
+	}()
+
+	f, err := fh.Open()
 	if err != nil {
 		return nil, err
 	}
-	defer out.Close()
-	if _, err = f.Seek(0, 0); err != nil {
+	out, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		_ = f.Close()
 		return nil, err
 	}
+	stagingExists = true
+	prefix := &limitedPrefixWriter{remaining: metadataPrefixSize}
 	h := sha256.New()
-	if _, err = io.Copy(io.MultiWriter(out, h), f); err != nil {
-		_ = os.Remove(path)
-		return nil, err
+	copyBuffer := make([]byte, 64<<10)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(out, h, prefix), io.LimitReader(f, s.cfg.UploadMaxBytes+1), copyBuffer)
+	if copyErr == nil && written > s.cfg.UploadMaxBytes {
+		copyErr = fmt.Errorf("file size is not allowed")
+	}
+	if copyErr == nil && written != fh.Size {
+		copyErr = fmt.Errorf("uploaded file size changed during processing")
+	}
+	if syncErr := out.Sync(); copyErr == nil && syncErr != nil {
+		copyErr = syncErr
+	}
+	if closeErr := out.Close(); copyErr == nil && closeErr != nil {
+		copyErr = closeErr
+	}
+	if closeErr := f.Close(); copyErr == nil && closeErr != nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		return nil, copyErr
+	}
+	if ext == ".pdf" && !strings.HasPrefix(string(prefix.data), "%PDF-") {
+		return nil, fmt.Errorf("file signature mismatch")
+	}
+
+	var meta pdfmeta.Extracted
+	if ext == ".pdf" {
+		meta = pdfmeta.Extract(prefix.data)
 	}
 	title := strings.TrimSuffix(filepath.Base(fh.Filename), ext)
 	if meta.Title != "" {
@@ -1891,17 +2068,77 @@ func (s *Server) saveUpload(ctx context.Context, fh *multipart.FileHeader) (map[
 		publishedAt = &d
 	}
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO papers(id,title,abstract_text,authors_json,journal,published_at,reading_status,parse_status,source_type,added_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, title, "", authorsJSON, meta.Subject, publishedAt, "unread", "queued", "upload", now, now)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		_ = os.Remove(path)
 		return nil, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO paper_files(id,paper_id,object_key,original_name,media_type,size_bytes,sha256,scan_status,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, uuid.NewString(), id, id+ext, fh.Filename, fh.Header.Get("Content-Type"), fh.Size, hex.EncodeToString(h.Sum(nil)), "pending", now)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, `INSERT INTO papers(id,title,abstract_text,authors_json,journal,published_at,reading_status,parse_status,source_type,added_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, title, "", authorsJSON, meta.Subject, publishedAt, "unread", "queued", "upload", now, now)
 	if err != nil {
-		_ = os.Remove(path)
 		return nil, err
 	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO paper_files(id,paper_id,object_key,original_name,media_type,size_bytes,sha256,scan_status,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, uuid.NewString(), id, objectKey, fh.Filename, fh.Header.Get("Content-Type"), written, hex.EncodeToString(h.Sum(nil)), "pending", now)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Rename(stagingPath, finalPath); err != nil {
+		return nil, err
+	}
+	stagingExists = false
+	finalExists = true
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	finalExists = false
 	return map[string]any{"uploadId": id, "filename": fh.Filename, "status": "queued"}, nil
+}
+
+func removeFailedUpload(path string, cause error) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("%w; unable to clean up %s: %v", cause, filepath.Base(path), err)
+	}
+	return cause
+}
+
+type limitedPrefixWriter struct {
+	data      []byte
+	remaining int
+}
+
+func (w *limitedPrefixWriter) Write(p []byte) (int, error) {
+	if w.remaining > 0 {
+		n := len(p)
+		if n > w.remaining {
+			n = w.remaining
+		}
+		w.data = append(w.data, p[:n]...)
+		w.remaining -= n
+	}
+	return len(p), nil
+}
+
+func (s *Server) reserveUploadQuota(ctx context.Context, size int64) error {
+	if s.cfg.UploadQuotaBytes <= 0 || size > s.cfg.UploadQuotaBytes {
+		return fmt.Errorf("upload quota exceeded")
+	}
+	s.uploadQuotaMu.Lock()
+	defer s.uploadQuotaMu.Unlock()
+
+	var used int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes),0) FROM paper_files`).Scan(&used); err != nil {
+		return fmt.Errorf("unable to check upload quota: %w", err)
+	}
+	if used > s.cfg.UploadQuotaBytes-size-s.uploadReserved {
+		return fmt.Errorf("upload quota exceeded")
+	}
+	s.uploadReserved += size
+	return nil
+}
+
+func (s *Server) releaseUploadQuota(size int64) {
+	s.uploadQuotaMu.Lock()
+	s.uploadReserved -= size
+	s.uploadQuotaMu.Unlock()
 }
 
 func (s *Server) paperByID(w http.ResponseWriter, r *http.Request) {
@@ -2038,8 +2275,15 @@ func (s *Server) patchPaper(w http.ResponseWriter, r *http.Request, id string) {
 		args = append(args, *req.Abstract)
 	}
 	if req.DOI != nil {
-		sets = append(sets, "doi=?")
-		args = append(args, *req.DOI)
+		rawDOI := strings.TrimSpace(*req.DOI)
+		normalizedDOI, validDOI := normalizeDOIQuery(rawDOI)
+		sets = append(sets, "doi=?", "normalized_doi=?")
+		args = append(args, rawDOI)
+		if validDOI {
+			args = append(args, strings.ToLower(normalizedDOI))
+		} else {
+			args = append(args, nil)
+		}
 	}
 	if req.ReadingStatus != nil {
 		if *req.ReadingStatus != "unread" && *req.ReadingStatus != "reading" && *req.ReadingStatus != "read" {
@@ -2193,7 +2437,9 @@ func (s *Server) authenticate(r *http.Request) (uint64, bool) {
 	}
 	var id uint64
 	var expires time.Time
-	err = s.db.QueryRowContext(r.Context(), `SELECT admin_id,expires_at FROM sessions WHERE token_hash=? AND revoked_at IS NULL`, s.secureHash(c.Value)).Scan(&id, &expires)
+	err = s.db.QueryRowContext(r.Context(), `SELECT s.admin_id,s.expires_at
+		FROM sessions s JOIN admins a ON a.id=s.admin_id AND a.token_version=s.token_version
+		WHERE s.token_hash=? AND s.revoked_at IS NULL`, s.secureHash(c.Value)).Scan(&id, &expires)
 	return id, err == nil && expires.After(time.Now())
 }
 func validEmail(v string) bool {
@@ -2201,11 +2447,20 @@ func validEmail(v string) bool {
 	return len(v) >= 3 && len(v) <= 254 && strings.Contains(v, "@") && !strings.ContainsAny(v, "\r\n")
 }
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+	remote := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		remote = host
 	}
-	return r.RemoteAddr
+	remoteIP := net.ParseIP(remote)
+	if remoteIP != nil && remoteIP.IsLoopback() {
+		if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
+			return forwarded.String()
+		}
+	}
+	if remoteIP != nil {
+		return remoteIP.String()
+	}
+	return remote
 }
 func randomToken(n int) string {
 	b := make([]byte, n)
@@ -2249,7 +2504,9 @@ func (s *Server) validCSRF(r *http.Request) bool {
 		return false
 	}
 	var stored string
-	err = s.db.QueryRowContext(r.Context(), `SELECT csrf_hash FROM sessions WHERE token_hash=? AND revoked_at IS NULL AND expires_at>UTC_TIMESTAMP(6)`, s.secureHash(session.Value)).Scan(&stored)
+	err = s.db.QueryRowContext(r.Context(), `SELECT s.csrf_hash
+		FROM sessions s JOIN admins a ON a.id=s.admin_id AND a.token_version=s.token_version
+		WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>UTC_TIMESTAMP(6)`, s.secureHash(session.Value)).Scan(&stored)
 	return err == nil && hmac.Equal([]byte(stored), []byte(s.secureHash(csrf.Value)))
 }
 func sameSite(v string) http.SameSite {

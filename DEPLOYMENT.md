@@ -22,7 +22,7 @@
 
 1. 服务器已安装 **Docker Engine 24+** 和 **Docker Compose v2**（`docker compose version` 能正常输出）。
 2. 服务器上已运行 **MySQL 8.0+**（宝塔面板、系统包安装或另一台数据库服务器均可）。
-3. 宿主机的 `HTTP_PORT`（默认 80）和 `API_PORT`（默认 8080）未被其他服务占用（`ss -tlnp | grep -E ':80|:8080'` 检查；被占用就在 `.env` 里换端口）。
+3. 宿主机的 `HTTP_PORT`（默认 8081）和 `API_PORT`（默认 8080）未被其他服务占用（`ss -tlnp | grep -E ':8081|:8080'` 检查；被占用就在 `.env` 里换端口）。
 
 ## 二、准备 MySQL
 
@@ -58,7 +58,7 @@ vim .env
 | `MYSQL_PASSWORD` | 上一步为 `paper_kb_app` 设置的密码 |
 | `JWT_SECRET` | 至少 32 字符的随机串，用于会话/CSRF 签名 |
 | `SETUP_SECRET` | 至少 32 字符的随机串，首次初始化管理员时使用；**必须与 JWT_SECRET 不同** |
-| `PUBLIC_BASE_URL` | 实际访问地址，如 `http://1.2.3.4` 或 `https://papers.example.com` |
+| `PUBLIC_BASE_URL` | 实际 HTTPS 访问地址，如 `https://papers.example.com` |
 
 生成随机密钥：
 
@@ -70,10 +70,11 @@ openssl rand -base64 48
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HTTP_PORT` | `80` | Web 对外服务端口（宝塔/Nginx 反代时填反代目标端口） |
+| `HTTP_PORT` | `8081` | Web 回环监听端口，也是宝塔/Nginx 的反代目标端口 |
+| `NGINX_HOST` | `127.0.0.1` | Web 监听地址；生产环境保持回环地址，禁止直接暴露 |
 | `API_PORT` | `8080` | API 监听端口，仅绑定 `127.0.0.1` 不对外暴露；与其他项目冲突时修改 |
 | `MYSQL_HOST` | `127.0.0.1` | MySQL 在本机时保持默认；在其他服务器时填其 IP |
-| `COOKIE_SECURE` | `false` | 通过 HTTPS 域名访问时改为 `true`；用 `http://IP` 访问时必须保持 `false`，否则浏览器不回传 Cookie、无法登录 |
+| `COOKIE_SECURE` | `true` | 生产模式必须保持 `true` |
 | `TRASH_RETENTION_DAYS` | `10` | 论文进入回收站后的保留天数，允许 1 至 365；旧 `.env` 不配置时自动使用 10 天 |
 | `GO_IMAGE` 等 | Docker Hub 官方镜像 | 国内服务器拉取超时时换成镜像加速地址，如 `镜像加速域名/library/golang:1.22-alpine` |
 | `AUTO_MIGRATE` | `true` | 启动时自动执行版本化数据库迁移（已应用的版本会跳过） |
@@ -96,7 +97,7 @@ Windows Server（PowerShell）：
 
 ## 五、初始化管理员（只执行一次）
 
-1. 打开 `http://服务器IP:HTTP_PORT/setup`。
+1. 配置宿主机 HTTPS 反向代理到 `http://127.0.0.1:HTTP_PORT`，然后打开 `PUBLIC_BASE_URL/setup`。
 2. 填写：
    - **初始化令牌**：`.env` 中的 `SETUP_SECRET`
    - 管理员邮箱、显示名称（邮箱仅作为登录账号，不发送任何邮件）
@@ -201,9 +202,9 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
 - `Access denied` → 账号/密码不对，确认存在 `'paper_kb_app'@'localhost'`（或 `'127.0.0.1'`/`'%'`）且密码与 `.env` 一致；
 - `Unknown database` → 数据库还没建，按第二节执行建库 SQL。
 
-**能打开页面但登录后立刻退回登录页**
+**服务启动时报 `PUBLIC_BASE_URL must be an absolute https URL`**
 
-- 用 `http://IP` 访问时 `.env` 中 `COOKIE_SECURE` 必须为 `false`（改完后 `bash deploy.sh` 重新部署）。
+- 生产环境必须配置 HTTPS 域名，并由宿主机 Nginx/Caddy 或云负载均衡终止 TLS；不再支持直接通过明文 `http://IP` 登录。
 
 **日志显示 `JWT_SECRET must contain at least 32 bytes`**
 
@@ -253,7 +254,7 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
 
 **部署成功但外网打不开页面**
 
-- 宿主机防火墙（ufw/宝塔安全页）没放行 `HTTP_PORT`。推荐做法：不开端口，直接在宝塔给域名建站点开 HTTPS，反向代理到 `http://127.0.0.1:HTTP_PORT`（回环流量不受防火墙限制）；或临时 `ufw allow HTTP_PORT/tcp` 用 IP 直连测试。
+- 确认宿主机 HTTPS 站点已反向代理到 `http://127.0.0.1:HTTP_PORT`。Web 端口默认只监听回环地址，无需也不应在防火墙放行。
 
 ## 八、标签与分类
 
@@ -266,7 +267,7 @@ curl -i http://127.0.0.1:8989/api/health        # 8989 换成 .env 里的 HTTP_P
 
 ## 九、安全建议
 
-- 生产环境建议用宿主机 Nginx/Caddy 或云负载均衡做 **HTTPS 终止**，然后把 `COOKIE_SECURE` 改为 `true`。
+- 生产环境必须用宿主机 Nginx/Caddy 或云负载均衡做 **HTTPS 终止**，并保持 `COOKIE_SECURE=true`。
 - `SETUP_SECRET` 在初始化完成后即失去作用，但仍不要泄露 `.env`（已在 `.gitignore` 中，勿提交）。
 - 登录有速率限制（默认 10 分钟窗口内多次失败会锁定 10 分钟），限流状态保存在 API 进程内存中，容器重启后重置——单管理员场景下足够。
 - 定期执行第六节的数据库与上传文件备份。

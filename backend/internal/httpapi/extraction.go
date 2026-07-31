@@ -47,25 +47,27 @@ func (s *Server) extractPapers(w http.ResponseWriter, r *http.Request) {
 			results = append(results, result{FileName: fh.Filename})
 			continue
 		}
+		if err := s.acquireUploadSlot(r.Context()); err != nil {
+			results = append(results, result{FileName: fh.Filename})
+			continue
+		}
 		f, err := fh.Open()
 		if err != nil {
+			s.releaseUploadSlot()
 			results = append(results, result{FileName: fh.Filename})
 			continue
 		}
 
-		head := make([]byte, 512)
-		n, _ := io.ReadFull(f, head)
-		head = head[:n]
-		if !strings.HasPrefix(string(head), "%PDF-") {
-			f.Close()
+		raw, readErr := io.ReadAll(io.LimitReader(f, metadataPrefixSize))
+		closeErr := f.Close()
+		if readErr != nil || closeErr != nil || !strings.HasPrefix(string(raw), "%PDF-") {
+			s.releaseUploadSlot()
 			results = append(results, result{FileName: fh.Filename})
 			continue
 		}
-		f.Seek(0, 0)
-		raw, _ := io.ReadAll(f)
-		f.Close()
 
 		meta := pdfmeta.Extract(raw)
+		s.releaseUploadSlot()
 		results = append(results, result{FileName: fh.Filename, Meta: meta})
 	}
 	writeJSON(w, http.StatusOK, results)
@@ -93,13 +95,26 @@ func (s *Server) reextractPaper(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusInternalServerError, "internal_error", "invalid stored paper file path")
 		return
 	}
-	raw, err := os.ReadFile(path)
+	if err := s.acquireUploadSlot(r.Context()); err != nil {
+		writeError(w, http.StatusRequestTimeout, "request_cancelled", "request was cancelled")
+		return
+	}
+	f, err := os.Open(path)
 	if err != nil {
+		s.releaseUploadSlot()
+		writeError(w, http.StatusInternalServerError, "internal_error", "unable to read paper file")
+		return
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(f, metadataPrefixSize))
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil {
+		s.releaseUploadSlot()
 		writeError(w, http.StatusInternalServerError, "internal_error", "unable to read paper file")
 		return
 	}
 
 	meta := pdfmeta.Extract(raw)
+	s.releaseUploadSlot()
 
 	var params []any
 	var sets []string

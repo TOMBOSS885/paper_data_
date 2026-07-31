@@ -1,8 +1,16 @@
 limit_req_zone $binary_remote_addr zone=api_per_ip:10m rate=15r/s;
 
 server {
-  listen ${NGINX_PORT};
+  # The production default is loopback-only; terminate TLS in the host proxy.
+  listen ${NGINX_HOST}:${NGINX_PORT};
   server_name _;
+
+  # Only a host-local TLS proxy may supply the original client address.
+  set_real_ip_from 127.0.0.1;
+  set_real_ip_from ::1;
+  real_ip_header X-Real-IP;
+  real_ip_recursive off;
+
   root /usr/share/nginx/html;
   index index.html;
 
@@ -11,13 +19,25 @@ server {
   keepalive_timeout 65s;
   server_tokens off;
 
+  gzip on;
+  gzip_vary on;
+  gzip_proxied any;
+  gzip_comp_level 6;
+  gzip_min_length 1024;
+  gzip_types application/json application/javascript text/css text/plain image/svg+xml;
+
   add_header X-Content-Type-Options "nosniff" always;
   add_header X-Frame-Options "DENY" always;
   add_header Referrer-Policy "no-referrer" always;
   add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
   add_header Content-Security-Policy "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'" always;
 
-  location = /healthz { access_log off; add_header Content-Type text/plain; return 200 'ok\n'; }
+  location = /healthz {
+    access_log off;
+    proxy_pass http://127.0.0.1:${API_PORT}/api/health/ready;
+    proxy_connect_timeout 2s;
+    proxy_read_timeout 3s;
+  }
 
   location /api/ {
     limit_req zone=api_per_ip burst=30 nodelay;
