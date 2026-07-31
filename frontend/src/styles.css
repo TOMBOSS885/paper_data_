@@ -547,6 +547,7 @@ kbd { padding: 1px 6px; border: 1px solid var(--line); border-radius: 4px; backg
 .import-panel { padding: 25px; }
 .dropzone { min-height: 230px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px dashed color-mix(in srgb, var(--accent) 55%, var(--line)); border-radius: 8px; background: var(--primary-soft); color: var(--ink); text-align: center; cursor: pointer; }
 .dropzone:hover { border-color: var(--primary); background: var(--surface-soft); }
+.dropzone.dragging { border-color: var(--primary); background: var(--surface); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--primary) 24%, transparent); }
 .dropzone strong { color: var(--ink); font-size: 14px; }
 .dropzone span { color: var(--muted); font-size: 11px; }
 .dropzone input { display: none; }

@@ -1,6 +1,6 @@
 import { Component, memo, useDeferredValue } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, ReactNode } from 'react'
+import type { CSSProperties, DragEvent, ReactNode } from 'react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, BookOpen, CheckCircle2, ChevronDown, ChevronRight, Clock3, Database, Download, Eye, Filter, FolderPlus, Info, LayoutDashboard, LogOut, Menu, Moon, RotateCcw, Save, Search, Settings2, Star, Sun, Tag as TagIcon, Tags, TrendingUp, Trash2, TriangleAlert, Upload, X } from 'lucide-react'
@@ -1467,7 +1467,9 @@ function Import() {
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [previewing, setPreviewing] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const dragDepthRef = useRef(0)
 
   const pick = (list: FileList | null) => {
     setError('')
@@ -1486,6 +1488,35 @@ function Import() {
     }
     setFiles(chosen)
     setPreviewResults([])
+  }
+
+  const handleDragEnter = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (!event.dataTransfer.types.includes('Files')) return
+    dragDepthRef.current += 1
+    setIsDragging(true)
+  }
+
+  const handleDragOver = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.dataTransfer.types.includes('Files')) event.dataTransfer.dropEffect = 'copy'
+  }
+
+  const handleDragLeave = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) setIsDragging(false)
+  }
+
+  const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    dragDepthRef.current = 0
+    setIsDragging(false)
+    if (event.dataTransfer.files.length > 0) pick(event.dataTransfer.files)
   }
 
   const preview = async () => {
@@ -1530,11 +1561,26 @@ function Import() {
         </div>
       </div>
       <div className="import-panel">
-        <label className="dropzone">
+        <label
+          className={`dropzone${isDragging ? ' dragging' : ''}`}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
           <Upload size={28} />
-          <strong>点击选择文件，或把文件拖到这里</strong>
+          <strong>{isDragging ? '释放文件以添加' : '点击选择文件，或把文件拖到这里'}</strong>
           <span>服务端会校验扩展名、大小和 PDF 文件头。</span>
-          <input ref={inputRef} type="file" multiple accept={ALLOWED_EXTENSIONS.join(',')} onChange={(e) => pick(e.target.files)} />
+          <input
+            ref={inputRef}
+            type="file"
+            multiple
+            accept={ALLOWED_EXTENSIONS.join(',')}
+            onChange={(event) => {
+              pick(event.target.files)
+              event.target.value = ''
+            }}
+          />
         </label>
         <NoticeModal open={Boolean(error)} variant="error" message={error} onClose={() => setError('')} />
         {files.length > 0 && (
