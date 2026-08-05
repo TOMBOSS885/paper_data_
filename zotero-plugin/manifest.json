@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "name": "Paper KB Sync",
+  "version": "0.1.9",
+  "description": "Selectively synchronize Zotero papers with a private Paper KB server",
+  "homepage_url": "https://github.com/TOMBOSS885/paper_data_",
+  "author": "Paper KB",
+  "icons": {
+    "48": "icons/paper-kb-sync.svg",
+    "96": "icons/paper-kb-sync.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "paper-kb-sync@your-domain.example",
+      "update_url": "https://github.com/TOMBOSS885/paper_data_/releases/latest/download/paper-kb-sync-updates.json",
+      "strict_min_version": "8.0-beta.21",
+      "strict_max_version": "10.99.99"
+    }
+  }
+}

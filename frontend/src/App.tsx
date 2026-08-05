@@ -13,6 +13,7 @@ import {
   changePassword,
   createAdmin,
   createCategory,
+  createSyncToken,
   createTag,
   dashboard,
   deleteCategory,
@@ -20,6 +21,7 @@ import {
   deleteTag,
   fileUrl,
   listCategories,
+  listSyncTokens,
   useCategories,
   listTags,
   useTags,
@@ -30,6 +32,7 @@ import {
   papers as fetchPapers,
   reextractPaper,
   restoreTrashPaper,
+  revokeSyncToken,
   setupStatus,
   trashPapers,
   updatePaper,
@@ -1861,11 +1864,17 @@ function Security() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  const [syncTokens, setSyncTokens] = useState<{ id: string; prefix: string; scopes: string[]; createdAt: string; lastUsedAt?: string; revokedAt?: string }[]>([])
+  const [syncTokenName, setSyncTokenName] = useState('Zotero')
+  const [issuedToken, setIssuedToken] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
     me(false, controller.signal)
       .then((r) => setAccount(r.data))
+      .catch((e) => !isAbortError(e) && setError(errorMessage(e)))
+    listSyncTokens(controller.signal)
+      .then((r) => setSyncTokens(r.data.items))
       .catch((e) => !isAbortError(e) && setError(errorMessage(e)))
     return () => controller.abort()
   }, [])
@@ -1885,6 +1894,34 @@ function Security() {
       }, 1500)
     } catch (e) {
       setError(errorMessage(e))
+      setBusy(false)
+    }
+  }
+
+  const createToken = async () => {
+    setError('')
+    setIssuedToken('')
+    setBusy(true)
+    try {
+      const response = await createSyncToken({ name: syncTokenName.trim() || 'Zotero' })
+      setIssuedToken(response.data.token)
+      const tokens = await listSyncTokens()
+      setSyncTokens(tokens.data.items)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const revokeToken = async (id: string) => {
+    setBusy(true)
+    try {
+      await revokeSyncToken(id)
+      setSyncTokens((items) => items.map((item) => item.id === id ? { ...item, revokedAt: new Date().toISOString() } : item))
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
       setBusy(false)
     }
   }
@@ -1924,6 +1961,23 @@ function Security() {
           </dl>
           <div className="filter-note">
             登录失败次数过多会临时锁定账号；会话有效期由 .env 中的 SESSION_TTL_SECONDS 控制。忘记密码时可清空数据库 admins 表后重新运行 /setup。
+          </div>
+        </div>
+        <div className="panel">
+          <div className="panel-head"><h2>Zotero 同步令牌</h2></div>
+          <p className="muted">每个插件或设备使用一个独立令牌。新令牌只显示一次。</p>
+          <label className="field">令牌名称<input value={syncTokenName} onChange={(e) => setSyncTokenName(e.target.value)} maxLength={120} /></label>
+          <button className="button primary" type="button" onClick={() => void createToken()} disabled={busy}>{busy ? '创建中…' : '创建同步令牌'}</button>
+          {issuedToken && (
+            <label className="field">请立即复制到 Zotero 插件设置<input readOnly value={issuedToken} onFocus={(e) => e.currentTarget.select()} /></label>
+          )}
+          <div className="meta-list">
+            {syncTokens.length === 0 ? <p className="muted">尚未创建同步令牌。</p> : syncTokens.map((token) => (
+              <div key={token.id}>
+                <dt><code>{token.prefix}…</code><small> {token.scopes.join(', ')}</small></dt>
+                <dd>{token.revokedAt ? '已撤销' : <button type="button" className="text-button danger" disabled={busy} onClick={() => void revokeToken(token.id)}>撤销</button>}</dd>
+              </div>
+            ))}
           </div>
         </div>
       </div>

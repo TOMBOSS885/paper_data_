@@ -1,0 +1,13 @@
+window { min-width: 960px; min-height: 560px; }
+vbox { min-height: 0; }
+.toolbar, .filters, .footer { padding: 8px; align-items: center; }
+.filters { border-top: 1px solid #bbb; border-bottom: 1px solid #bbb; gap: 6px; }
+#table-wrap { overflow: auto; margin: 0 8px; }
+table { border-collapse: collapse; width: 100%; font-family: sans-serif; }
+th, td { border-bottom: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
+th { position: sticky; top: 0; background: #f5f5f5; }
+tr[data-status="conflict"], tr[data-status="both_changed"] { background: #fff8e1; }
+tr[data-status="local_only"] { background: #eef8ff; }
+tr[data-status="server_only"] { background: #f0fff2; }
+.muted { color: #666; font-size: 0.9em; }
+.status { white-space: nowrap; font-weight: 600; }

@@ -109,6 +109,12 @@ export const logout = () => api('/auth/logout', { method: 'POST' })
 export const changePassword = (currentPassword: string, newPassword: string) =>
   api('/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) })
 
+export type SyncToken = { id: string; prefix: string; scopes: string[]; expiresAt?: string; lastUsedAt?: string; revokedAt?: string; createdAt: string }
+export const listSyncTokens = (signal?: AbortSignal) => api<{ data: { items: SyncToken[] } }>('/auth/sync-tokens', { signal, cache: 'no-store' })
+export const createSyncToken = (payload: { name: string; clientInstanceId?: string; displayName?: string; scopes?: string[] }) =>
+  api<{ data: { token: string; clientId: string; scopes: string[] } }>('/auth/sync-tokens', { method: 'POST', body: JSON.stringify(payload) })
+export const revokeSyncToken = (id: string) => api(`/auth/sync-tokens/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
 export const papers = (params = '', signal?: AbortSignal) => api<{ data: { items: Paper[]; total: number; page: number; pageSize: number } }>(`/papers${params}`, { signal })
 export const trashPapers = (params = '', signal?: AbortSignal) =>
   api<{ data: { items: TrashPaper[]; total: number; page: number; pageSize: number; retentionDays: number } }>(`/trash${params}`, { signal })

@@ -147,6 +147,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/papers/", s.paperByID)
 	mux.HandleFunc("/api/trash", s.trash)
 	mux.HandleFunc("/api/trash/", s.trashByID)
+	s.registerZoteroRoutes(mux)
 
 	return s.withMiddleware(mux)
 }
@@ -294,12 +295,12 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 		}
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token,X-Request-ID")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token,X-Request-ID,Authorization,Idempotency-Key,Content-Range,If-Match,If-Range")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if requiresCSRF(r) && !s.validCSRF(r) {
+		if requiresCSRF(r) && !hasBearerToken(r) && !s.validCSRF(r) {
 			writeError(w, http.StatusForbidden, "csrf_failed", "request validation failed")
 			return
 		}
@@ -2493,6 +2494,11 @@ func requiresCSRF(r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+func hasBearerToken(r *http.Request) bool {
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	return len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && parts[1] != ""
 }
 func (s *Server) validCSRF(r *http.Request) bool {
 	session, err := r.Cookie("pkb_session")

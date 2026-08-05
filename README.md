@@ -9,6 +9,10 @@ React + Go + MySQL 的单管理员论文知识库。部署步骤见 [`DEPLOYMENT
 - Docker：`deploy/docker-compose.yml` 包含 API 和 Web 两个容器，均运行在宿主机网络上；API 按 `.env` 中的配置经 `127.0.0.1` 直连服务器 MySQL（无需改 bind-address 和防火墙），Web(Nginx) 托管前端并反代 `/api/`。
 - 不依赖 Redis 和 SMTP：限流在 API 进程内存中实现，登录无需邮箱验证码。
 
+## Zotero 同步
+
+Zotero 7 插件源码位于 [`zotero-plugin/`](zotero-plugin/)，安装、使用和服务器升级见 [`ZOTERO_SYNC.md`](ZOTERO_SYNC.md)。同步前会展示本地与服务器差异，并允许选择性上传或拉取。
+
 ## 快速部署
 
 ```bash

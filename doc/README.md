@@ -14,6 +14,7 @@
 6. [分步实施、测试与验收](./06-implementation-plan.md)
 7. [OpenAPI 3.1 契约](./openapi.yaml)
 8. [环境变量模板](./env.example)
+9. [Zotero 论文同步插件与服务端适配规范](./07-zotero-sync-plugin.md)
 
 ## 结论摘要
 
