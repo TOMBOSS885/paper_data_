@@ -1,6 +1,5 @@
 <vbox xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
-      xmlns:html="http://www.w3.org/1999/xhtml"
-      onload="PaperKBSyncPrefs.init();">
+      xmlns:html="http://www.w3.org/1999/xhtml">
   <linkset><html:link rel="localization" href="paper-kb-sync.ftl" /></linkset>
   <groupbox>
     <label><html:h2 data-l10n-id="paper-kb-sync-settings">Paper KB 同步</html:h2></label>
@@ -8,7 +7,7 @@
     <html:input id="paper-kb-sync-server" type="url" preference="extensions.paper-kb-sync.serverURL" placeholder="https://paper.example.com" />
     <label control="paper-kb-sync-token">同步令牌（只保存到系统凭据库）</label>
     <html:input id="paper-kb-sync-token" type="password" />
-    <button id="paper-kb-sync-save" label="保存令牌并测试连接" onclick="PaperKBSyncPrefs.save();" />
-    <label id="paper-kb-sync-status" value="" />
+    <button id="paper-kb-sync-save" type="button" label="保存令牌并测试连接" />
+    <html:div id="paper-kb-sync-status" role="status" aria-live="polite"></html:div>
   </groupbox>
 </vbox>

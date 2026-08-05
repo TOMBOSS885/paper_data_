@@ -3,8 +3,9 @@ $ErrorActionPreference = 'Stop'
 $pluginRoot = Split-Path -Parent $PSScriptRoot
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("paper-kb-sync-xpi-" + [guid]::NewGuid().ToString('N'))
 $dist = Join-Path $PSScriptRoot 'dist'
-$zip = Join-Path $dist 'paper-kb-sync-0.1.9.zip'
-$xpi = Join-Path $dist 'paper-kb-sync-0.1.9.xpi'
+$version = (Get-Content -Raw (Join-Path $PSScriptRoot 'manifest.json') | ConvertFrom-Json).version
+$zip = Join-Path $dist "paper-kb-sync-$version.zip"
+$xpi = Join-Path $dist "paper-kb-sync-$version.xpi"
 
 New-Item -ItemType Directory -Path $stage | Out-Null
 New-Item -ItemType Directory -Path $dist -Force | Out-Null

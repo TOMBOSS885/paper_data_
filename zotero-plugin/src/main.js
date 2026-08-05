@@ -22,15 +22,23 @@ var PaperKBSync = (() => {
     return String(pref("serverURL")).replace(/\/$/, "");
   }
 
+  function credentialOrigin() {
+    try { return new URL(serverURL()).origin; } catch (_) { return ""; }
+  }
+
+  function matchingCredentials(origin) {
+    return Services.logins.findLogins(origin, null, "Paper KB Sync");
+  }
+
   function externalLibraryKey(libraryID) {
     return pref("externalLibraryKey") || `local:${ensureClientInstanceId()}:${libraryID}`;
   }
 
   function getCredential() {
-    const host = serverURL();
-    if (!host || !Services.logins) return "";
+    const origin = credentialOrigin();
+    if (!origin || !Services.logins) return "";
     try {
-      const logins = Services.logins.findLogins({}, host, null, "Paper KB Sync");
+      const logins = matchingCredentials(origin);
       return logins.length ? logins[0].password : "";
     } catch (e) {
       Zotero.debug(`Paper KB Sync credential read failed: ${e}`);
@@ -39,14 +47,14 @@ var PaperKBSync = (() => {
   }
 
   function saveCredential(token) {
-    const host = serverURL();
-    if (!host || !Services.logins) throw new Error("先配置服务器地址");
+    const origin = credentialOrigin();
+    if (!origin || !Services.logins) throw new Error("先配置服务器地址");
     const LoginInfo = Components.Constructor(
       "@mozilla.org/login-manager/loginInfo;1", null,
       "init", [Ci.nsILoginInfo]
     );
-    const info = new LoginInfo(host, null, "Paper KB Sync", "", token, "", "");
-    const old = Services.logins.findLogins({}, host, null, "Paper KB Sync");
+    const info = new LoginInfo(origin, null, "Paper KB Sync", "paper-kb-sync", token, "", "");
+    const old = matchingCredentials(origin);
     for (const login of old) Services.logins.removeLogin(login);
     Services.logins.addLogin(info);
   }

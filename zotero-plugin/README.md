@@ -1,12 +1,12 @@
-# Paper KB Sync for Zotero 7
+# Paper KB Sync for Zotero 8+
 
 This directory contains the Zotero 7 plugin source. The packaged plugin is
-created at `dist/paper-kb-sync-0.1.9.xpi`.
+created at `dist/paper-kb-sync-0.2.1.xpi`.
 
 ## Install
 
 1. In Zotero 7, open `Tools -> Plugins`.
-2. Drag `paper-kb-sync-0.1.0.xpi` into the Plugins window and restart Zotero.
+2. Drag the latest `paper-kb-sync-*.xpi` into the Plugins window and restart Zotero.
 3. Open `Edit -> Settings -> Paper KB Sync`.
 4. Enter the public HTTPS URL of this Paper KB deployment and paste a sync token.
 5. Select normal Zotero items, then use `Tools -> Paper KB Sync` to upload or
@@ -27,6 +27,12 @@ From the repository root on Windows:
 ```
 
 The XPI must have `manifest.json` and `bootstrap.js` at its archive root.
+
+Run the preference-page regression tests with:
+
+```powershell
+node --test .\zotero-plugin\tests\preferences.test.mjs
+```
 
 ## Development
 
