@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -61,6 +62,17 @@ type syncPaper struct {
 	Metadata     syncMetadata   `json:"metadata"`
 	MetadataHash string         `json:"metadataHash"`
 	File         map[string]any `json:"file"`
+}
+
+// sync_tokens.token_prefix is deliberately short because it is only a display
+// identifier. The full token is hashed and is never stored in plaintext.
+const syncTokenPrefixMaxLength = 16
+
+func syncTokenPrefix(token string) string {
+	if len(token) <= syncTokenPrefixMaxLength {
+		return token
+	}
+	return token[:syncTokenPrefixMaxLength]
 }
 
 func (s *Server) registerZoteroRoutes(mux *http.ServeMux) {
@@ -208,7 +220,7 @@ func (s *Server) syncTokens(w http.ResponseWriter, r *http.Request) {
 		secret := randomToken(32)
 		token := "pkb_zot_" + secret[:12] + "." + secret
 		b, _ := json.Marshal(req.Scopes)
-		if _, err = tx.ExecContext(r.Context(), `INSERT INTO sync_tokens(id,client_id,token_prefix,token_hash,scopes_json,created_at) VALUES(?,?,?,?,?,UTC_TIMESTAMP(6))`, uuid.NewString(), clientID, token[0:20], s.secureHash(token), string(b)); err != nil {
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO sync_tokens(id,client_id,token_prefix,token_hash,scopes_json,created_at) VALUES(?,?,?,?,?,UTC_TIMESTAMP(6))`, uuid.NewString(), clientID, syncTokenPrefix(token), s.secureHash(token), string(b)); err != nil {
 			return err
 		}
 		if err = tx.Commit(); err != nil {
@@ -217,6 +229,7 @@ func (s *Server) syncTokens(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, map[string]any{"token": token, "clientId": clientID, "scopes": req.Scopes})
 		return nil
 	}(); err != nil {
+		log.Printf("unable to create sync token: %v", err)
 		writeError(w, 500, "internal_error", "unable to create sync token")
 	}
 }
